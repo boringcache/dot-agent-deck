@@ -1127,6 +1127,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the NATIVE `get-seed` pull that normally wins the race (`take_pending_seed_native` and its flag are unit-tested beside it); the two production callers that arm it; the `Ambiguous` partial-write branch.
 - **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
 
+##### prompt/pane-input/034 — A successor's own stashed seed survives a departed agent's expiring PTY-injection fallback and is still pullable by the successor (issue #617, Greptile P1 on PR #919).
+- **Layer:** fast integration, in `src/agent_pty.rs`'s own `mod spawn_tests` (the real `arm_seed_fallback` against registry-owned PTYs; no daemon, no pi, no extension, no LLM and no `e2e` feature gate).
+- **Agent:** none — two `/bin/cat` byte targets, the second inheriting the first's `DOT_AGENT_DECK_PANE_ID`. The grace is passed as a PARAMETER (200 ms), so the 15 s default and its second-granularity `DOT_AGENT_DECK_SEED_FALLBACK_SECS` env var are both out of the picture.
+- **Asserts:** the other half of `prompt/pane-input/033`, positively. A thread-scoped `tracing` subscriber at DEBUG must capture the armed task reporting `left untouched and nothing injected` — proof it fired AND took the leave-it-alone branch, which "the seed is still there" alone cannot give, since a task that never ran leaves it there too. Then `take_pending_seed_native` must return the SUCCESSOR'S seed byte for byte and mark the pull native. Then neither seed's bytes may appear in the successor's scrollback, barriered by an `Applied` authorized write asserted visible first.
+- **Why it exists:** `prompt/pane-input/033` pinned that the armed injection writes no bytes, which was never the whole property. The take that fed that refusal was keyed by pane id alone, so it consumed whatever seed the pane held — after a hand-over, the successor's — and the refusal then dropped it. No bytes went anywhere and the successor still lost its opening task, findable by neither its native `get-seed` pull nor its own fallback.
+- **Does not assert:** the native `get-seed` pull's own pane-keyed resolution of a caller-supplied pane id (issue #916); the two production callers that arm the fallback; the `Ambiguous` partial-write branch.
+- **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
