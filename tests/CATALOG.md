@@ -603,6 +603,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the delegate/respawn machinery itself (`orchestration/delegate/022`, `/023`), the TUI-side `ui.pane_display_names` mirror that independently rescues the name on every non-dispatched orchestration path, or rendered card layout.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/supersede/009 — A pane's `started_at` survives a same-key respawn, so the card reports when the PANE started rather than when the replacement's first frame arrived.
+- **Layer:** L1 (successive Pi generations under one stable producer session id applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations using the production `{pane_id}-session` construction).
+- **Asserts:** after a second Pi registry agent reports through the same producer session id 60s later with no `SessionEnd` in between, the surviving card's `started_at` is still the first generation's instant.
+- **Does not assert:** any rendered surface. `started_at` currently feeds only `filter_sessions`' `(None, None)` sort tiebreak, which a paned session never reaches, and it is not carried on `SessionSnapshot` — so this pins the field's honesty for its future readers rather than a visible change. Duration surfaces deliberately read elsewhere: the daemon's `last_activity_ms` (`session/live/013`) and the registry's observed spawn instant (`session/live/014`), both of which were chosen over `started_at` precisely because it used to reset.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/010 — A pane's `started_at` survives a cross-key respawn too, so the two respawn shapes agree about when the pane started being used.
+- **Layer:** L1 (a spawn-time generation and a replacement under a different session id applied through `AppState::apply_event`).
+- **Agent:** none (synthetic generations under two distinct registry agent ids).
+- **Asserts:** after the replacement retires the outgoing card 60s later with no `SessionEnd` in between, exactly one card remains and its `started_at` is the outgoing generation's instant.
+- **Does not assert:** the graceful path, where `SessionEnd` already populated `pane_started_at` before this change (`status/supersede/008` covers the friendly name across that same boundary); nor any rendered surface, for the reasons under `status/supersede/009`.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/supersede/011 — A frame naming another pane cannot take over a card's identity or history on a session-key match alone.
+- **Layer:** L1 (two registered panes and one shared producer session id applied through `AppState::apply_event`).
+- **Agent:** none (synthetic Pi generations under two distinct registry agent ids).
+- **Asserts:** after a Pi card on pane A accumulates a tool tally, a frame carrying the same producer session id but pane B's id and a different registry agent id leaves the card's `agent_id`, `tool_count` and `started_at` untouched.
+- **Does not assert:** that the card stays on pane A. The unconditional `session.pane_id` refresh further down `apply_event` still moves a surviving card onto the event's pane; that is a separate seam with its own consumers (untagged adoption depends on it) and is out of scope for issue #321, which is about the identity refresh. Nor does it assert that session ids ARE unique across panes — the point is that the supersession no longer trusts an assumption nothing enforces.
+- **Platform coverage:** mac+linux+windows.
+
 #### status/shell-activity
 
 ##### status/shell-activity/001 — The process-table primitive finds a real, detached grandchild process as a descendant and reports its no-controlling-tty / session-leader / argv / session-id facts correctly (PRD #386 M1).
