@@ -2218,7 +2218,7 @@ fn arm_idle_worker_watch(
             .write_and_submit_guarded(
                 &orchestrator_pane_id,
                 &prompt,
-                Some(&delegation.orchestrator_agent_id),
+                &delegation.orchestrator_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -2871,7 +2871,7 @@ fn arm_delegate_silence_watch(
             .write_and_submit_guarded(
                 &orchestrator_pane_id,
                 &notice,
-                Some(&expected_agent_id),
+                &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -4508,9 +4508,14 @@ async fn dispatch_one_owned(
                          stashing seed for native get-seed pull (no injection)"
                     );
                     registry.set_pending_seed(&pane_id, &one_liner);
+                    // Issue #617 (finding 6): bind the fallback to the agent the
+                    // respawn just produced. This task sleeps for the grace
+                    // window holding only a pane id, and a pane id is a recycled
+                    // handle — see [`crate::agent_pty::arm_seed_fallback`].
                     crate::agent_pty::arm_seed_fallback(
                         registry.clone(),
                         pane_id.clone(),
+                        new_agent_id.clone(),
                         crate::agent_pty::seed_fallback_grace(),
                     );
                     // Commission audit exit 1: the pointer is DELIVERED here,
@@ -4650,39 +4655,54 @@ async fn dispatch_one_owned(
                          agent; surfacing a notice in the orchestrator pane and skipping the \
                          task pointer write"
                     );
-                    // A GUARDED notice, unlike the respawn-error arm below.
-                    // That arm reports a failure it learned about immediately,
-                    // while this one has just spent up to
-                    // `SESSION_START_WAIT_TIMEOUT` waiting — long enough for the
-                    // ORCHESTRATOR's pane to change hands, at which point an
-                    // unguarded write puts one orchestration's diagnostics into a
-                    // stranger's scrollback (PRD #249 finding B3's reasoning,
-                    // pinned by `scheduler/idle-worker/008` and `/014`). Resolved
+                    // A GUARDED notice, like the respawn-error arm below. This
+                    // one has just spent up to `SESSION_START_WAIT_TIMEOUT`
+                    // waiting — long enough for the ORCHESTRATOR's pane to change
+                    // hands, at which point an unguarded write puts one
+                    // orchestration's diagnostics into a stranger's scrollback
+                    // (PRD #249 finding B3's reasoning, pinned by
+                    // `scheduler/idle-worker/008` and `/014`). Resolved
                     // immediately before the call, so the guard's real work is the
                     // post-lock re-validation.
+                    //
+                    // Issue #617: the resolution used to be handed straight to
+                    // `write_notice_guarded` as an `Option`, and an absent
+                    // identity then skipped the primitive's identity gate — so in
+                    // exactly the case where the orchestrator pane had just been
+                    // freed (`None`), the notice fell through as an UNGUARDED
+                    // write to whoever had inherited the pane id. An unresolved
+                    // orchestrator is now treated as no verified target and the
+                    // notice is dropped into this log instead.
                     let notice = compose_respawn_no_live_worker_notice(&pane_id);
                     let notice_registry = Arc::clone(&registry);
                     let notice_pane = orchestrator_pane_id.clone();
                     let notice_orchestration = orchestration.clone();
-                    match registry
-                        .write_notice_guarded(
-                            &orchestrator_pane_id,
-                            &notice,
+                    let orchestrator_agent_id =
+                        registry.pane_current_agent_id(&orchestrator_pane_id);
+                    let notice_outcome = match orchestrator_agent_id.as_deref() {
+                        Some(orchestrator_agent_id) => {
                             registry
-                                .pane_current_agent_id(&orchestrator_pane_id)
-                                .as_deref(),
-                            || async move {
-                                if notice_registry.is_pane_closing(&notice_pane) {
-                                    return false;
-                                }
-                                orchestration_still_matches(
-                                    notice_orchestration.as_ref(),
-                                    notice_registry.pane_orchestration(&notice_pane).as_ref(),
+                                .write_notice_guarded(
+                                    &orchestrator_pane_id,
+                                    &notice,
+                                    orchestrator_agent_id,
+                                    || async move {
+                                        if notice_registry.is_pane_closing(&notice_pane) {
+                                            return false;
+                                        }
+                                        orchestration_still_matches(
+                                            notice_orchestration.as_ref(),
+                                            notice_registry
+                                                .pane_orchestration(&notice_pane)
+                                                .as_ref(),
+                                        )
+                                    },
                                 )
-                            },
-                        )
-                        .await
-                    {
+                                .await
+                        }
+                        None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
+                    };
+                    match notice_outcome {
                         Ok(crate::agent_pty::GuardedSend::Applied) => {}
                         Ok(refused) => warn!(
                             pane_id = %orchestrator_pane_id,
@@ -5000,13 +5020,12 @@ async fn dispatch_one_owned(
                 // pane's scrollback is a high-level message so
                 // a stray filesystem path (or other detail
                 // from `AgentPtyError::Spawn`) doesn't leak
-                // into the orchestrator LLM's view. Using
-                // `write_to_pane_notice` (no SUBMIT_DELAY, LF
-                // tail instead of CR) means the notice forms a
-                // visible line in scrollback without an Enter
-                // — the orchestrator's LLM sees it as
-                // scrollback noise, not a user prompt to
-                // respond to.
+                // into the orchestrator LLM's view. Using the
+                // NOTICE tail (no SUBMIT_DELAY, LF instead of
+                // CR) means the notice forms a visible line in
+                // scrollback without an Enter — the
+                // orchestrator's LLM sees it as scrollback
+                // noise, not a user prompt to respond to.
                 warn!(
                     pane_id = %pane_id,
                     role = %target_role,
@@ -5019,17 +5038,60 @@ async fn dispatch_one_owned(
                     "⚠ respawn failed for role '{target_role}' on pane \
                      {pane_id} (see daemon log for details)"
                 );
-                if let Err(write_err) = registry
-                    .write_to_pane_notice(&orchestrator_pane_id, &notice)
-                    .await
-                {
-                    warn!(
+                // Issue #617: GUARDED, like the dead-replacement arm above. This
+                // arm used to take the unguarded `write_to_pane_notice` on the
+                // reasoning that it "reports a failure it learned about
+                // immediately", so no pane could change hands in between. That is
+                // an argument about a window's SIZE, not about the write being
+                // safe — the terminate phase preceding this failure has already
+                // disposed of the previous child, and the orchestrator's own pane
+                // is a separately-owned recycled handle that this task holds no
+                // claim on. Resolving the orchestrator's current agent and binding
+                // to it costs one registry lookup and makes the post-lock
+                // re-validation do the real work, so the two sibling arms of the
+                // same `match` no longer disagree about whether a notice into the
+                // orchestrator pane needs an identity.
+                let notice_registry = Arc::clone(&registry);
+                let notice_pane = orchestrator_pane_id.clone();
+                let notice_orchestration = orchestration.clone();
+                let orchestrator_agent_id = registry.pane_current_agent_id(&orchestrator_pane_id);
+                let notice_outcome = match orchestrator_agent_id.as_deref() {
+                    Some(orchestrator_agent_id) => {
+                        registry
+                            .write_notice_guarded(
+                                &orchestrator_pane_id,
+                                &notice,
+                                orchestrator_agent_id,
+                                || async move {
+                                    if notice_registry.is_pane_closing(&notice_pane) {
+                                        return false;
+                                    }
+                                    orchestration_still_matches(
+                                        notice_orchestration.as_ref(),
+                                        notice_registry.pane_orchestration(&notice_pane).as_ref(),
+                                    )
+                                },
+                            )
+                            .await
+                    }
+                    None => Ok(crate::agent_pty::GuardedSend::NoLiveTarget),
+                };
+                match notice_outcome {
+                    Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                    Ok(refused) => warn!(
+                        pane_id = %orchestrator_pane_id,
+                        role = %target_role,
+                        outcome = ?refused,
+                        "delegate: the respawn-failure notice was refused; the \
+                         failure stays in this log only"
+                    ),
+                    Err(write_err) => warn!(
                         pane_id = %orchestrator_pane_id,
                         role = %target_role,
                         error = %write_err,
                         "delegate: failed to surface respawn error in \
                          orchestrator pane scrollback"
-                    );
+                    ),
                 }
                 // Issue #448 review (@prageethw, round 2): the respawn
                 // died, so nothing will be delivered on this exit
@@ -5183,7 +5245,7 @@ async fn dispatch_one_owned(
             .write_and_submit_guarded_detailed(
                 &pane_id,
                 &one_liner,
-                Some(worker_agent_id),
+                worker_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -6470,9 +6532,20 @@ impl AppState {
                 );
             }
         }
+        // Issue #617 (finding 7): the orchestrator identity the retired delegation
+        // was ISSUED by — `(pane, registry agent id)` — carried down to the
+        // feedback write below so the report goes to the conversation that
+        // commissioned it or to nothing at all. `None` when nothing was
+        // outstanding, which is the unsolicited case; see the write itself for
+        // what that falls back to and why it is weaker.
+        let mut commissioning_orchestrator: Option<(String, String)> = None;
         match registry.retire_outstanding_delegation(&signal.pane_id) {
             crate::agent_pty::DelegationRetirement::Nothing => {}
             crate::agent_pty::DelegationRetirement::Retired(delegation) => {
+                commissioning_orchestrator = Some((
+                    delegation.orchestrator_pane_id.clone(),
+                    delegation.orchestrator_agent_id.clone(),
+                ));
                 tracing::debug!(
                     pane_id = %signal.pane_id,
                     role = %delegation.role,
@@ -6487,7 +6560,10 @@ impl AppState {
                 role,
                 seq,
                 remaining,
+                orchestrator_pane_id,
+                orchestrator_agent_id,
             } => {
+                commissioning_orchestrator = Some((orchestrator_pane_id, orchestrator_agent_id));
                 tracing::debug!(
                     pane_id = %signal.pane_id,
                     role = %role,
@@ -6596,16 +6672,91 @@ impl AppState {
         }
 
         let feedback = compose_work_done_feedback(&safe_name, channel, &signal.task);
-        if let Err(e) = registry
-            .write_to_pane_and_submit(&orch_pane_id, &feedback)
-            .await
-        {
+        // Issue #617 (finding 7): GUARDED. This used to be
+        // `write_to_pane_and_submit`, keyed by pane id and nothing else, so an
+        // orchestrator that was respawned or rebound between the routing lookup
+        // above and this write had a previous conversation's completion report
+        // typed into it and submitted — and a pane id is a recycled handle, so
+        // the new occupant need not even be part of this orchestration.
+        //
+        // The identity preferred is the one the delegation was COMMISSIONED by,
+        // and it is used only when its own orchestrator pane agrees with the pane
+        // `orchestrator_for_worker` just resolved: two different routes to "the
+        // orchestrator" must agree before one is used to authorize the other.
+        //
+        // The fallback — the pane's CURRENT live agent, resolved immediately
+        // before the call — is deliberately weaker, and it is what an UNSOLICITED
+        // completion gets, because there is no commissioning delegation to name an
+        // identity. It does not prove the recipient is the conversation that asked
+        // for anything (nothing asked), but it does bind the write to a concrete
+        // agent, so the primitive's post-lock re-validation still refuses a pane
+        // that changes hands between here and the write. An orchestrator pane with
+        // no live agent yields no identity at all and the feedback is dropped into
+        // this log, which is the same outcome the unguarded write reached by
+        // failing.
+        let expected_orchestrator_agent_id = match commissioning_orchestrator {
+            Some((commissioned_pane, commissioned_agent)) if commissioned_pane == orch_pane_id => {
+                Some(commissioned_agent)
+            }
+            _ => registry.pane_current_agent_id(&orch_pane_id),
+        };
+        let Some(expected_orchestrator_agent_id) = expected_orchestrator_agent_id else {
             warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                "work-done: the orchestrator pane has no live agent to authorize the feedback \
+                 write; nothing written"
+            );
+            return;
+        };
+        // Re-validated under the held writer, the same two questions every other
+        // orchestrator-bound delivery on this path asks: the pane must not be
+        // mid-close, and it must still be in the orchestration this completion was
+        // routed within. `orchestration_still_matches` fails OPEN when either side
+        // is unknown, so this can refuse nothing the routing above accepted for a
+        // reason other than a re-home during the write's wait for the writer.
+        let expected_orchestration = self.pane_orchestration_map.get(&orch_pane_id).cloned();
+        let outcome = registry
+            .write_and_submit_guarded(
+                &orch_pane_id,
+                &feedback,
+                &expected_orchestrator_agent_id,
+                || async {
+                    if registry.is_pane_closing(&orch_pane_id) {
+                        return false;
+                    }
+                    orchestration_still_matches(
+                        expected_orchestration.as_ref(),
+                        registry.pane_orchestration(&orch_pane_id).as_ref(),
+                    )
+                },
+            )
+            .await;
+        match outcome {
+            Ok(crate::agent_pty::GuardedSend::Applied) => {}
+            // A partial write: some bytes reached the AUTHORIZED orchestrator, so
+            // the report is not retried into a duplicate half-line. Distinguished
+            // from the refusals below because bytes DID land — treating it as
+            // undelivered would invite exactly the retry that doubles it.
+            Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                "work-done: feedback delivery was ambiguous (partial write); not retried"
+            ),
+            Ok(refused) => warn!(
+                pane_id = %orch_pane_id,
+                role = %role_name,
+                expected_agent_id = %expected_orchestrator_agent_id,
+                outcome = ?refused,
+                "work-done: identity gate refused the feedback write (the orchestrator pane no \
+                 longer belongs to the agent this completion was routed to); nothing written"
+            ),
+            Err(e) => warn!(
                 pane_id = %orch_pane_id,
                 role = %role_name,
                 error = %e,
                 "work-done: failed to write feedback into orchestrator pane"
-            );
+            ),
         }
     }
 
@@ -10136,7 +10287,7 @@ mod tests {
                 .write_and_submit_guarded(
                     ORCHESTRATOR_PANE,
                     PROMPT,
-                    Some(&orchestrator_agent),
+                    &orchestrator_agent,
                     || async { true },
                 )
                 .await
@@ -10171,12 +10322,9 @@ mod tests {
         let notice = compose_worker_exited_notice(WORKER_PANE);
         assert_eq!(
             registry
-                .write_notice_guarded(
-                    ORCHESTRATOR_PANE,
-                    &notice,
-                    Some(&orchestrator_agent),
-                    || async { true },
-                )
+                .write_notice_guarded(ORCHESTRATOR_PANE, &notice, &orchestrator_agent, || async {
+                    true
+                },)
                 .await
                 .expect("production worker-exited notice"),
             crate::agent_pty::GuardedSend::Applied
@@ -10194,7 +10342,7 @@ mod tests {
         );
 
         let probe = registry
-            .write_and_submit_guarded(ORCHESTRATOR_PANE, "", Some(&orchestrator_agent), || async {
+            .write_and_submit_guarded(ORCHESTRATOR_PANE, "", &orchestrator_agent, || async {
                 true
             })
             .await
@@ -10269,7 +10417,7 @@ mod tests {
         ] {
             assert_eq!(
                 registry
-                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .write_and_submit_guarded(pane, &report, agent, || async { true })
                     .await
                     .expect("first silence report"),
                 crate::agent_pty::GuardedSend::Applied,
@@ -10286,15 +10434,11 @@ mod tests {
         registry.note_user_input(UNSETTLED_PANE);
 
         let settled_repeat = registry
-            .write_and_submit_guarded(SETTLED_PANE, &report, Some(&settled_agent), || async {
-                true
-            })
+            .write_and_submit_guarded(SETTLED_PANE, &report, &settled_agent, || async { true })
             .await
             .expect("second identical silence report after settling");
         let unsettled_repeat = registry
-            .write_and_submit_guarded(UNSETTLED_PANE, &report, Some(&unsettled_agent), || async {
-                true
-            })
+            .write_and_submit_guarded(UNSETTLED_PANE, &report, &unsettled_agent, || async { true })
             .await
             .expect("second identical silence report without settling");
         registry.shutdown_all();
@@ -10371,7 +10515,7 @@ mod tests {
         ] {
             assert_eq!(
                 registry
-                    .write_and_submit_guarded(pane, &report, Some(agent), || async { true })
+                    .write_and_submit_guarded(pane, &report, agent, || async { true })
                     .await
                     .expect("first silence report"),
                 crate::agent_pty::GuardedSend::Applied,
@@ -10402,15 +10546,11 @@ mod tests {
         registry.note_user_input(APPLIED_PANE);
 
         let ambiguous_repeat = registry
-            .write_and_submit_guarded(AMBIGUOUS_PANE, &report, Some(&ambiguous_agent), || async {
-                true
-            })
+            .write_and_submit_guarded(AMBIGUOUS_PANE, &report, &ambiguous_agent, || async { true })
             .await
             .expect("second identical silence report after an ambiguous first");
         let applied_repeat = registry
-            .write_and_submit_guarded(APPLIED_PANE, &report, Some(&applied_agent), || async {
-                true
-            })
+            .write_and_submit_guarded(APPLIED_PANE, &report, &applied_agent, || async { true })
             .await
             .expect("second identical silence report after an applied first");
         registry.shutdown_all();

@@ -1182,6 +1182,14 @@ async fn compute_write_and_submit_outcome(
             // arms — the resolution block above refuses an identity-less request
             // outright — so every guarded call below binds to a concrete id
             // rather than forwarding an `Option`.
+            //
+            // Issue #617 made that a TYPE rather than a local invariant:
+            // `write_and_submit_guarded` takes a `&str`, so this `expect` is the
+            // only place the refusal above has to be re-stated, and the calls
+            // below could not forward an `Option` even if this block regressed.
+            // The early refusal is kept as the cheaper, better-reported gate —
+            // it answers `SendResult::NoLiveTarget` without touching the
+            // registry — not because the primitive still needs it.
             let agent_id = extras
                 .expected_agent_id
                 .clone()
@@ -1194,7 +1202,7 @@ async fn compute_write_and_submit_outcome(
                 // target.
                 let agent_for_check = agent_id.clone();
                 registry
-                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                    .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
                         st.read().await.agent_writable(&agent_for_check) == Writable::Live
                     })
                     .await
@@ -1202,7 +1210,7 @@ async fn compute_write_and_submit_outcome(
                 let pane_for_check = pane_id.to_string();
                 let expected_session = extras.expected_session_id.clone();
                 registry
-                    .write_and_submit_guarded(pane_id, text, Some(&agent_id), move || async move {
+                    .write_and_submit_guarded(pane_id, text, &agent_id, move || async move {
                         // PRD #20 Greptile P1 (daemon_protocol.rs:988) + the
                         // stale-pre-lock-snapshot CLASS close: this closure runs
                         // UNDER the held target writer, immediately before the
@@ -1654,9 +1662,14 @@ async fn handle_connection(
                         && !seed.trim().is_empty()
                     {
                         registry.set_pending_seed(pane_id, seed);
+                        // Issue #617 (finding 6): bind the fallback to the agent
+                        // this spawn just produced, so an injection that fires
+                        // after the pane has been recycled is refused rather
+                        // than typed into its new occupant.
                         crate::agent_pty::arm_seed_fallback(
                             registry.clone(),
                             pane_id.to_string(),
+                            id.clone(),
                             crate::agent_pty::seed_fallback_grace(),
                         );
                     }

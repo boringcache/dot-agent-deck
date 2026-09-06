@@ -1782,6 +1782,73 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
+/// Issue #617 (finding 3): deliver a dispatch result back to the agent that
+/// asked for it, bound to the registry agent id captured from the caller's
+/// `AgentRecord` *before* the dispatch ran.
+///
+/// The write used to be inline in `run_hook_loop`'s `Dispatch` arm and used the
+/// unguarded `write_to_pane_and_submit(&signal.pane_id, …)`. Between the request
+/// and this delivery sits `handle_dispatch` — a git worktree creation plus an
+/// agent spawn, unbounded and deliberately performed outside any `AppState` lock
+/// — which is one of the widest race windows in the daemon. A pane id is a
+/// recycled handle, so a caller that was closed or respawned during that work had
+/// its dispatch result submitted into whatever process inherited its pane, which
+/// may then act on it with its own tools.
+///
+/// Extracted rather than fixed in place so the delivery has a name and a seam:
+/// the slow half (`handle_dispatch`) was already unit-testable and this half was
+/// not, which is why the only coverage of it was end-to-end.
+///
+/// Every refusal is terminal and none is retried — a retry could only re-target
+/// whichever process now occupies the pane. `Ambiguous` is deliberately NOT
+/// folded in with the refusals: bytes of ours already reached the authorized
+/// caller, so re-sending would duplicate a half-written message rather than
+/// repair it, and the caller is the one place where that distinction is visible.
+pub async fn deliver_dispatch_result(
+    registry: &AgentPtyRegistry,
+    pane_id: &str,
+    expected_agent_id: &str,
+    message: &str,
+) -> crate::agent_pty::GuardedSend {
+    use crate::agent_pty::GuardedSend;
+    match registry
+        .write_and_submit_guarded(pane_id, message, expected_agent_id, || async { true })
+        .await
+    {
+        Ok(GuardedSend::Applied) => GuardedSend::Applied,
+        Ok(GuardedSend::Ambiguous) => {
+            warn!(
+                pane_id = %pane_id,
+                agent_id = %expected_agent_id,
+                "dispatch: result delivery was ambiguous (partial write); not retried"
+            );
+            GuardedSend::Ambiguous
+        }
+        Ok(refused) => {
+            warn!(
+                pane_id = %pane_id,
+                agent_id = %expected_agent_id,
+                outcome = ?refused,
+                "dispatch: identity gate refused the result (the caller pane no longer belongs \
+                 to the agent that requested the dispatch); nothing written"
+            );
+            refused
+        }
+        Err(e) => {
+            warn!(
+                pane_id = %pane_id,
+                agent_id = %expected_agent_id,
+                error = %e,
+                "dispatch: failed to write result into caller pane"
+            );
+            // A transport error, not a refusal: no identity decision was
+            // reached. Reported as `Stale` so callers have one vocabulary, with
+            // the real cause on the `warn!` above.
+            GuardedSend::Stale
+        }
+    }
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -1884,20 +1951,31 @@ async fn run_hook_loop(
 
                                     use std::path::PathBuf;
 
-                                    // Phase 1: resolve caller cwd from the PTY registry's
-                                    // AgentRecord.cwd, not AppState::pane_cwd_map.
-                                    // pane_cwd_map is only populated for orchestration
-                                    // panes; mode panes (including the dispatcher mode)
-                                    // never get an entry there, which would make every
-                                    // dispatch from a mode pane a silent no-op.
-                                    let cwd = {
+                                    // Phase 1: resolve the caller's (agent id, cwd)
+                                    // from ONE `AgentRecord` in the PTY registry, not
+                                    // from AppState::pane_cwd_map. pane_cwd_map is only
+                                    // populated for orchestration panes; mode panes
+                                    // (including the dispatcher mode) never get an entry
+                                    // there, which would make every dispatch from a mode
+                                    // pane a silent no-op.
+                                    //
+                                    // Issue #617 (finding 3): the agent id is captured
+                                    // HERE, from the same record as the cwd, and carried
+                                    // through the slow phase below so the result can be
+                                    // delivered to the agent that ASKED rather than to
+                                    // whoever holds its pane id when the work finishes.
+                                    // Reading both from one record is what makes them a
+                                    // consistent pair; two lookups could straddle a
+                                    // hand-over and pair one agent's cwd with another's
+                                    // identity.
+                                    let caller = {
                                         let records = pty_registry.agent_records();
                                         records
                                             .iter()
                                             .find(|r| r.pane_id_env.as_deref() == Some(&signal.pane_id))
-                                            .and_then(|r| r.cwd.clone())
+                                            .and_then(|r| r.cwd.clone().map(|cwd| (r.id.clone(), cwd)))
                                     };
-                                    let cwd = match cwd {
+                                    let (caller_agent_id, cwd) = match caller {
                                         Some(c) => c,
                                         None => {
                                             warn!(pane_id = %signal.pane_id, "dispatch from unknown pane");
@@ -1941,18 +2019,15 @@ async fn run_hook_loop(
                                     )
                                     .await;
 
-                                    // Deliver result to the caller pane (doesn't need
-                                    // any AppState lock — uses the PTY registry).
-                                    if let Err(e) = pty_registry
-                                        .write_to_pane_and_submit(&signal.pane_id, &result.message)
-                                        .await
-                                    {
-                                        warn!(
-                                            pane_id = %signal.pane_id,
-                                            error = %e,
-                                            "dispatch: failed to write result into caller pane"
-                                        );
-                                    }
+                                    // Deliver result to the caller (doesn't need any
+                                    // AppState lock — uses the PTY registry).
+                                    deliver_dispatch_result(
+                                        &pty_registry,
+                                        &signal.pane_id,
+                                        &caller_agent_id,
+                                        &result.message,
+                                    )
+                                    .await;
                                 }
                                 DaemonMessage::WorkDone(signal) => {
                                     info!(

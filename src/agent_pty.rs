@@ -119,9 +119,27 @@ pub fn seed_fallback_grace() -> std::time::Duration {
 /// the native `get-seed` pull — types it into the PTY. The `take`/`set` on the
 /// registry is atomic, so the extension's pull and this fallback can never both
 /// deliver. A no-op delivery (native already won) is the common, expected case.
+///
+/// Issue #617 (finding 6): `expected_agent_id` is the registry agent id of the
+/// agent the seed was stashed FOR, captured by the caller at spawn/respawn time,
+/// and the injection goes through [`AgentPtyRegistry::write_and_submit_guarded`]
+/// bound to it. This task sleeps for `grace` — 15s by default — holding nothing
+/// but a `pane_id`, and a pane id is a recycled handle: if the pi that owned it
+/// exits inside the window and an unrelated agent inherits the same
+/// `DOT_AGENT_DECK_PANE_ID`, the unguarded write this used to perform typed one
+/// conversation's seed into another's session and pressed Enter on it. A rebind
+/// now yields `WrongSession`/`Stale`/`NoLiveTarget` and zero bytes.
+///
+/// The seed is NOT restored to the registry when the guarded write refuses, and
+/// that is deliberate: `take_pending_seed_fallback` has already consumed it, and
+/// putting it back would leave it stashed under a pane id whose new occupant
+/// could pull it via `get-seed` — re-opening the same mis-delivery by the native
+/// route after the injection route refused it. Nothing re-arms this fallback, so
+/// a refusal means the seed is dropped, which is the intended failure direction.
 pub fn arm_seed_fallback(
     registry: Arc<AgentPtyRegistry>,
     pane_id: String,
+    expected_agent_id: String,
     grace: std::time::Duration,
 ) {
     tokio::spawn(async move {
@@ -130,17 +148,48 @@ pub fn arm_seed_fallback(
             Some(seed) => {
                 // Native pull did not happen within the grace window — deliver
                 // via the legacy PTY injection so the pane still works.
-                if let Err(e) = registry.write_to_pane_and_submit(&pane_id, &seed).await {
-                    tracing::warn!(
-                        pane_id = %pane_id,
-                        error = %e,
-                        "seed fallback: PTY injection failed"
-                    );
-                } else {
-                    tracing::debug!(
-                        pane_id = %pane_id,
-                        "seed fallback: delivered seed via PTY injection (native pull did not occur)"
-                    );
+                let outcome = registry
+                    .write_and_submit_guarded(&pane_id, &seed, &expected_agent_id, || async {
+                        true
+                    })
+                    .await;
+                match outcome {
+                    Ok(GuardedSend::Applied) => {
+                        tracing::debug!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            "seed fallback: delivered seed via PTY injection (native pull did not occur)"
+                        );
+                    }
+                    // A partial write: some of the seed reached the AUTHORIZED
+                    // agent. Not retried — a retry would append the seed to
+                    // whatever half of it is already sitting in the input box
+                    // and submit both as one turn.
+                    Ok(GuardedSend::Ambiguous) => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            "seed fallback: PTY injection was ambiguous (partial write); not retried"
+                        );
+                    }
+                    Ok(refused) => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            outcome = ?refused,
+                            "seed fallback: identity gate refused the PTY injection (the pane no \
+                             longer belongs to the agent the seed was stashed for); nothing \
+                             written and the seed is dropped"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            pane_id = %pane_id,
+                            agent_id = %expected_agent_id,
+                            error = %e,
+                            "seed fallback: PTY injection failed"
+                        );
+                    }
                 }
             }
             None => {
@@ -2996,6 +3045,18 @@ pub enum DelegationRetirement {
         seq: u64,
         /// Superseded delegations still unaccounted for after this one.
         remaining: u32,
+        /// Issue #617 (finding 7): the orchestrator pane and registry agent id
+        /// the still-armed record carries, so a late completion credited to a
+        /// superseded delegation can have its feedback bound to an identity in
+        /// the same way `Retired` can. Copied from the record rather than
+        /// returning it, because the record STAYS in the tracker on this arm and
+        /// so cannot be moved out. Both are needed together: the pane says where
+        /// the feedback would go and the agent id says who must still be there,
+        /// and a caller that resolved the orchestrator pane by a different route
+        /// must not bind that pane to this record's agent without checking the
+        /// two panes agree.
+        orchestrator_pane_id: String,
+        orchestrator_agent_id: String,
     },
 }
 
@@ -3824,6 +3885,8 @@ impl AgentPtyRegistry {
                 role: record.role.clone(),
                 seq: record.seq,
                 remaining: record.superseded,
+                orchestrator_pane_id: record.orchestrator_pane_id.clone(),
+                orchestrator_agent_id: record.orchestrator_agent_id.clone(),
             };
         }
         DelegationRetirement::Retired(
@@ -4282,7 +4345,7 @@ impl AgentPtyRegistry {
             .write_notice_guarded(
                 &orchestrator_pane_id,
                 &notice,
-                Some(&expected_agent_id),
+                &expected_agent_id,
                 || async move {
                     if revalidate_registry.is_pane_closing(&revalidate_pane) {
                         return false;
@@ -5563,11 +5626,24 @@ impl AgentPtyRegistry {
     /// pane→agent rebind re-check is replaced by an agent-still-present re-check —
     /// mirroring the attach STREAM_IN input loop, which resolves a paneless
     /// target's writer/writability by agent id and skips the pane-owner re-check.
+    ///
+    /// Issue #617: `expected_agent_id` is a `&str`, not an `Option<&str>`. It used
+    /// to be optional and the pre-lock identity gate ran only in the `Some` arm,
+    /// so `None` meant "write to whoever owns this pane right now" — a pane id is
+    /// a recycled handle, so that is the accidental mis-delivery the rest of this
+    /// machinery exists to prevent. Making it a `&str` removes the permissive case
+    /// from the type rather than from a comment: a caller with no identity to
+    /// offer cannot reach this method at all, and must decide at ITS OWN layer
+    /// whether that means "refuse" (`dispatch_one_owned`) or "resolve the pane's
+    /// current owner and let the post-lock re-validation do the work"
+    /// (`handle_work_done`'s unsolicited arm). Two independent reviews of the #608
+    /// fix each found permissive call sites the other missed, which is the
+    /// argument for letting the compiler enumerate them instead.
     pub async fn write_and_submit_guarded<Fut>(
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSend, AgentPtyError>
     where
@@ -5590,7 +5666,7 @@ impl AgentPtyRegistry {
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSendDetail, AgentPtyError>
     where
@@ -5630,7 +5706,7 @@ impl AgentPtyRegistry {
         &self,
         pane_id: &str,
         text: &str,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSend, AgentPtyError>
     where
@@ -5658,7 +5734,7 @@ impl AgentPtyRegistry {
         pane_id: &str,
         text: &str,
         mode: SubmitMode,
-        expected_agent_id: Option<&str>,
+        expected_agent_id: &str,
         revalidate: impl FnOnce() -> Fut,
     ) -> Result<GuardedSendDetail, AgentPtyError>
     where
@@ -5666,8 +5742,8 @@ impl AgentPtyRegistry {
     {
         let is_paneless = pane_id == "<no-pane>";
         let target = if is_paneless {
-            // Resolve BY agent identity; no identity → nothing to route to.
-            match expected_agent_id.and_then(|id| self.writer_target_for_agent(id)) {
+            // Resolve BY agent identity.
+            match self.writer_target_for_agent(expected_agent_id) {
                 Some(target) => target,
                 None => return Ok(GuardedSendDetail::Outcome(GuardedSend::NoLiveTarget)),
             }
@@ -5681,10 +5757,13 @@ impl AgentPtyRegistry {
         // than the one that now owns the pane (respawn/rebind before delivery).
         // A paneless target was resolved BY `expected_agent_id`, so it can never
         // mismatch here — skip the gate.
-        if !is_paneless
-            && let Some(expected) = expected_agent_id
-            && expected != target.agent_id
-        {
+        //
+        // Issue #617: this gate is now unconditional on the paned arm. It used to
+        // sit behind `let Some(expected) = expected_agent_id`, so an absent
+        // identity skipped it entirely and the send fell through as an unguarded
+        // write to the pane's entry-time owner. `expected_agent_id` is a `&str`,
+        // so that case no longer exists to be skipped.
+        if !is_paneless && expected_agent_id != target.agent_id {
             return Ok(GuardedSendDetail::Outcome(GuardedSend::WrongSession));
         }
         // Encode before locking so a bad payload doesn't pin the writer.
@@ -11041,12 +11120,17 @@ mod spawn_tests {
         let guard = target.writer.lock().await;
 
         let reg_for_task = reg.clone();
+        let id_for_task = id.clone();
         let mut task = tokio::spawn(async move {
             reg_for_task
                 .write_and_submit_guarded(
                     "pane-removal-barrier",
                     "printf 'REMOVED-AFTER-AUTH'",
-                    None,
+                    // Issue #617: the pane's own live agent, so the PRE-lock
+                    // identity gate passes and the send really does park on the
+                    // held writer. This used to be `None`, which passed the gate
+                    // by skipping it.
+                    &id_for_task,
                     // Liveness always "ok" — the ONLY thing that must reject is
                     // the removal re-resolution under the held writer.
                     || async { true },
@@ -11078,73 +11162,107 @@ mod spawn_tests {
         reg.shutdown_all();
     }
 
-    /// Pin the PRIMITIVE's documented-permissive `None`
-    /// behavior as an asserted fact, not merely a reader's inference from the
-    /// source. `write_guarded`'s pre-lock identity gate (`if !is_paneless &&
-    /// let Some(expected) = expected_agent_id && ...`) only compares
-    /// identities when `expected_agent_id` is `Some` — passing `None` skips
-    /// the gate entirely, and the call proceeds as an UNGUARDED write to
-    /// whoever currently owns the pane. That is correct at THIS layer: the
-    /// primitive is generic, and it is every caller's job never to pass
-    /// `None` when it needs verified delivery — `dispatch_one_owned`'s own
-    /// refusal (`dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved`
-    /// in `state.rs`) is exactly that caller-side responsibility. Without
-    /// this test, a future reader would have to re-derive the permissive
-    /// semantics from the gate's `if let` shape rather than finding them
-    /// asserted.
+    /// Issue #617: pin the PRIMITIVE's identity gate as an asserted fact for the
+    /// case that used to be permissive — a paned send whose expected agent is not
+    /// the agent that owns the pane right now.
+    ///
+    /// This test replaces `guarded_send_with_no_expected_identity_writes_to_the_live_pane`,
+    /// which asserted the opposite contract: that passing `None` as the expected
+    /// identity WROTE to whoever owned the pane. Its doc comment argued the
+    /// permissiveness was correct at this layer and that withholding `None` was
+    /// every caller's job. Issue #617 overturned that — two independent reviews of
+    /// the #608 fix each found callers that did pass an absent identity, and the
+    /// argument "it is the caller's job" is not a property anything checks. The
+    /// absent case is now unrepresentable (`expected_agent_id: &str`), so it can no
+    /// longer be tested at all; what survives, and what this pins, is the runtime
+    /// property that outlives it: a pane that CHANGES HANDS between the caller
+    /// resolving its target and the write is refused with [`GuardedSend::WrongSession`]
+    /// and zero bytes.
+    ///
+    /// Both halves are asserted. The outcome alone would pass if the write had
+    /// landed anyway, and the byte check alone would pass if the successor's PTY
+    /// were simply slow — so the successor's scrollback is read only after a
+    /// readiness marker proves it is up and echoing.
     #[tokio::test]
-    async fn guarded_send_with_no_expected_identity_writes_to_the_live_pane() {
+    async fn guarded_send_refuses_a_pane_that_changed_hands_before_the_write() {
+        const PANE: &str = "pane-changed-hands-before-write";
+        const MARKER: &str = "must-not-reach-the-successor-marker";
+
         let reg = Arc::new(AgentPtyRegistry::new());
-        // `spawn_agent` returns the REGISTRY's own agent id — a UUID, not the
-        // `pane_id_env` string — and `AgentPtyRegistry::snapshot` reads
-        // scrollback by that agent id, so it has to be captured here rather
-        // than discarded.
-        let agent_id = reg
+        let original = reg
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
-                env: vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    "pane-no-expected-identity".to_string(),
-                )],
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
                 ..SpawnOptions::default()
             })
-            .expect("spawn agent");
+            .expect("spawn original agent");
+
+        // Hand the pane over: close the incumbent, then spawn a NEW agent onto
+        // the same `DOT_AGENT_DECK_PANE_ID`. The registry routes by that string,
+        // so the successor now owns the pane the caller resolved.
+        reg.close_agent(&original).expect("close original agent");
+        let successor = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn successor agent");
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW agent id"
+        );
 
         let outcome = reg
             .write_and_submit_guarded_detailed(
-                "pane-no-expected-identity",
-                "echo none-identity-permissive-marker",
-                None,
+                PANE,
+                &format!("echo {MARKER}"),
+                &original,
                 || async { true },
             )
             .await
             .expect("guarded send result");
         assert_eq!(
             outcome,
-            GuardedSendDetail::Outcome(GuardedSend::Applied),
-            "a None expected identity must not be refused by the primitive — it is the caller's \
-             job to withhold None when it wants verification"
+            GuardedSendDetail::Outcome(GuardedSend::WrongSession),
+            "a send bound to the pane's PREVIOUS owner must be refused once the pane has \
+             changed hands"
         );
 
-        // Confirm bytes actually reached the live pane, not merely that the
-        // outcome claims `Applied`.
+        // Prove the successor is up and echoing before reading its scrollback,
+        // so "no marker" cannot pass merely because the stub had not started.
+        let ready = reg
+            .write_and_submit_guarded(PANE, "echo SUCCESSOR-READY", &successor, || async { true })
+            .await
+            .expect("readiness write result");
+        assert_eq!(
+            ready,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a send bound to IT must be applied"
+        );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-        let mut found = false;
+        let mut ready_seen = false;
         while tokio::time::Instant::now() < deadline {
-            let snap = reg.snapshot(&agent_id).unwrap_or_default();
+            let snap = reg.snapshot(&successor).unwrap_or_default();
             if snap
-                .windows(b"none-identity-permissive-marker".len())
-                .any(|w| w == b"none-identity-permissive-marker")
+                .windows(b"SUCCESSOR-READY".len())
+                .any(|w| w == b"SUCCESSOR-READY")
             {
-                found = true;
+                ready_seen = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
         assert!(
-            found,
-            "the guarded primitive must have written the payload into the live pane when \
-             expected_agent_id was None"
+            ready_seen,
+            "precondition: the successor's PTY must be echoing before its scrollback is read \
+             for the refused payload"
+        );
+
+        let snap = reg.snapshot(&successor).unwrap_or_default();
+        assert!(
+            !snap.windows(MARKER.len()).any(|w| w == MARKER.as_bytes()),
+            "the refused payload must not appear in the SUCCESSOR's scrollback"
         );
 
         reg.shutdown_all();
