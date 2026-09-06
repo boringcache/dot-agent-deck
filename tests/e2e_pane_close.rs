@@ -297,13 +297,22 @@ fn close_confirm_009_stable_key_respawn_closes_nothing() {
         "timestamp": "2026-07-29T12:05:00Z",
         "pane_id": pane_id,
         "agent_id": "pi-agent-2",
+        "user_prompt": "generation-two-history-marker",
     });
     write_hook_line(deck.hook_socket_path(), &generation_two.to_string())
         .expect("write generation-two SessionStart hook");
-    // The rebuilt entry carries none of the dead generation's history, so the
-    // marker going away is a positive signal that generation two now occupies
-    // the pane — and it is the only tell there is, precisely because the two
-    // generations are otherwise indistinguishable on screen.
+    // Wait for generation two's OWN marker rather than for generation one's to
+    // vanish. Both would be satisfied by the same event, but only this one is
+    // satisfied by nothing else: an absence wait also passes if the card were
+    // merely covered or not yet drawn, which would make the barrier a race
+    // dressed as an observation. The marker is history the rebuilt entry could
+    // only have got from the generation-two frame, so seeing it means that
+    // frame has been applied. (The two generations remain indistinguishable in
+    // the field that decides the close — `agent_id` — which is the point; a
+    // prompt is card history, not identity.)
+    deck.wait_for_string("generation-two-history-marker");
+    // And generation one's history is gone with it, which is the #284
+    // same-producer identity refresh landing.
     deck.wait_for_absence("generation-one-history-marker");
 
     deck.send_keys(b"\x1b[B");
