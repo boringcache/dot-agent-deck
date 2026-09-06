@@ -1499,3 +1499,58 @@ fn form_007_issue_dispatch_option_seeds_issue_dispatch_authoring() {
     );
     drop(scratch);
 }
+
+/// Scenario: Launch the deck with one ENABLED fixture schedule, open the
+/// Scheduled Tasks manager and press `t` on the auto-selected row. Assert the
+/// global `schedules.toml` now carries `enabled = false` while every other field
+/// of the definition survives (pausing is not deleting), and that the row
+/// re-renders as `disabled`. Press `t` again and assert it returns to
+/// `enabled = true` — the toggle is reversible from the same key, which is why
+/// it has no confirmation step.
+#[spec("scheduler/manager/018")]
+#[test]
+fn manager_018_toggle_pauses_and_resumes_without_losing_the_definition() {
+    let (scratch, sched_path) = scratch_with_schedules(
+        "[[scheduled_tasks]]\n\
+         name = \"pausable\"\n\
+         cron = \"0 9 * * *\"\n\
+         working_dir = \"/tmp\"\n\
+         command = \"cat\"\n\
+         prompt = \"pausable prompt marker\"\n\
+         enabled = true\n",
+    );
+
+    let deck = TuiDeck::builder()
+        .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active sessions");
+
+    deck.send_keys(MANAGER_KEY);
+    deck.wait_for_string("Scheduled Tasks");
+    // The dialog renders the state but, before issue #914, had no key to change
+    // it — `t` is that key.
+    deck.send_keys(b"t");
+
+    // Half 1: the flag flipped on disk, through the validated writer.
+    common::wait_for_file_contains(&sched_path, "enabled = false");
+    // Half 2: pausing is NOT deleting — the definition survives intact. This is
+    // the distinction the button exists for: `[Delete d]` would discard all of it.
+    let paused = std::fs::read_to_string(&sched_path).expect("read schedules.toml");
+    for kept in [
+        "name = \"pausable\"",
+        "cron = \"0 9 * * *\"",
+        "prompt = \"pausable prompt marker\"",
+    ] {
+        assert!(
+            paused.contains(kept),
+            "pausing must preserve the whole definition; {kept} missing from:\n{paused}"
+        );
+    }
+    // Half 3: the row reflects it without reopening the dialog.
+    deck.wait_for_string("disabled");
+
+    // Half 4: reversible from the same key — which is why there is no confirm.
+    deck.send_keys(b"t");
+    common::wait_for_file_contains(&sched_path, "enabled = true");
+    drop(scratch);
+}

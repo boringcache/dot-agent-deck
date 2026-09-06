@@ -39,16 +39,15 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 | `Enter` / `e` / `[Edit e]` | **Edit** the selected row — opens the same **directory picker → Edit Schedule form** (picker starts at the row's directory), then spawns the seeded authoring agent **pre-filled** with the row's current values (it calls `schedule update`). |
 | `d` then `y` / `[Delete d]` | **Delete** the selected row's **definition only** (a confirmation appears first). It does **not** close an open/running tab for that schedule — deleting a schedule must not nuke a conversation you're reading. |
 | `r` / `[Run now r]` | **Run now** — fire the selected task immediately. |
+| `t` / `[Toggle t]` | **Pause / resume** the selected task — flips its `enabled` flag. No confirmation: press `t` again to reverse it. |
 | `j` / `k` | Move the selection. |
 | `Esc` / `q` / `s` | Close the dialog. |
 
 **Edits take effect on the next fire.** Change a schedule's prompt — or any field that affects a fire (cron, working dir, command, `new_tab_per_fire`) — and the next fire uses the new values, not the ones from when you first created the task.
 
-**What the dialog deliberately does not do.** There is **no in-place field editing** and **no inline enable/disable toggle** — that keeps the terminal dialog simple. **Rename is forbidden** on the edit path because `name` is the reuse-tab key; to rename, delete and add.
+**What the dialog deliberately does not do.** There is **no in-place field editing** — you change a task's fields by handing it to the authoring agent with `[Edit e]`, which keeps the terminal dialog simple. **Rename is forbidden** on the edit path because `name` is the reuse-tab key; to rename, delete and add.
 
-That leaves one gap worth naming: **pausing a schedule has no button.** Everything else you are likely to want — creating, editing, deleting, firing now, and seeing what is scheduled — is a key in this dialog, but flipping a task's `enabled` flag is not. Ask an agent to pause it for you, or set `enabled = false` in the [config file](#the-global-config-file).
-
-Pausing is not the same as deleting: **`[Delete d]` discards the definition** — prompt, cron, directory and all — while pausing keeps it and simply stops it firing, which is what you want for a schedule you are going away from or debugging.
+**Pausing is not the same as deleting.** `[Delete d]` discards the definition — prompt, cron, directory and all — while **`[Toggle t]`** just flips the task's `enabled` flag, so it stops firing and everything about it survives. That is what you want for a schedule you are going away from, or one firing noisily while you debug the thing it drives. Press `t` again to resume it; there is no confirmation step because it is reversible from the same key.
 
 ### What the authoring agent does
 

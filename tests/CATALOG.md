@@ -4555,6 +4555,14 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the exact modal width / clamp fraction at each terminal size; the `[min, max]` bounds of the shared helper (covered by the coder's pure-data unit test); the delete-confirmation containment (covered by `scheduler/manager/005`).
 - **Platform coverage:** mac+linux.
 
+##### scheduler/manager/018 — `t` on a row pauses or resumes that schedule, writing `enabled` through the validated writer without discarding the definition (issue #914).
+- **Layer:** L2 (PTY + vt100 `TuiDeck`, driving the real binary's Scheduled Tasks dialog).
+- **Agent:** none (the fixture task's command is `cat`; the test never fires it).
+- **Asserts:** with one `enabled = true` fixture task, pressing `t` in the manager writes `enabled = false` to the global `schedules.toml`; `name`, `cron` and `prompt` all survive that write; the row re-renders as `disabled` without reopening the dialog; and a second `t` returns it to `enabled = true`.
+- **Why it exists:** the dialog RENDERED `disabled` (and `—` for next-fire) long before it could produce that state — `schedule_cli::set_enabled` was reachable only from `main.rs`, never from `ui.rs`, so the one management action with no button was pausing, which is the one you want when a schedule is misbehaving. The definition-survives half is the point of the feature rather than a detail: `[Delete d]` discards prompt, cron and directory, so "pause" and "delete" are not interchangeable and a test that only checked the flag would not catch a toggle implemented as delete-and-recreate. The second `t` pins reversibility, which is the justification for having no confirmation step.
+- **Does not assert:** that a paused task stops firing on its cron (the loader's `enabled` gate owns that, and the scheduler's `reload_apply` tests cover registration); the daemon-side reload round trip; `[Run now r]` behaviour against a paused task.
+- **Platform coverage:** mac+linux.
+
 ##### scheduler/manager/010 — A blank/unset `default_command` falls back to `claude` (`DEFAULT_AUTHORING_COMMAND`) for the authoring agent, NOT a bare `$SHELL` (PRD #170 R1 fallback, via the unified Add flow).
 - **Layer:** L2 (drives the real manager + dir-picker + mode-locked form via PTY; observed via a `claude` recorder shim on disk).
 - **Agent:** the shimmed `claude` authoring agent (records the gated-delivered seed).
