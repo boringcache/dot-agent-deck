@@ -46,6 +46,25 @@ set -u
 
 linker="${DAD_LINKER:-cc}"
 
+# MOLD (issue #906). This workspace links ~130 test binaries, each statically
+# pulling the whole dependency graph's debug info, and issue #863 measured that
+# as an I/O and memory bound with the CPU idle. mold links the same objects with
+# far less of both.
+#
+# DETECTED HERE RATHER THAN SET IN RUSTFLAGS, and the difference is a failure
+# mode, not a preference. `-C link-arg=-fuse-ld=mold` in `.cargo/config.toml`
+# would hard-fail every build outside a devbox shell with `cannot find -fuse-ld=mold`,
+# including a plain `cargo build` on a contributor's machine. Detecting it means
+# a host without mold keeps its previous linker and builds exactly as before,
+# which is the same contract every other rung of this script already honours:
+# degrade to working, never fail for a reason the gate invented.
+#
+# DAD_NO_MOLD=1 opts out, for bisecting a suspected linker difference.
+if [ "${DAD_NO_MOLD:-}" != "1" ] && [ -z "${DAD_LINKER:-}" ] \
+   && command -v mold >/dev/null 2>&1; then
+    set -- -fuse-ld=mold "$@"
+fi
+
 here="$(dirname -- "$0")"
 gate="$here/build-gate.sh"
 [ -x "$gate" ] || exec "$linker" "$@"
