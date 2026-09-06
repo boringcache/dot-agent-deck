@@ -14,7 +14,7 @@
 //! `encode_pane_payload` (single-line → no wrap) in isolation. This test
 //! exercises the REAL daemon dispatch wiring end to end — `handle_delegate`
 //! → `dispatch_one_owned` → `compose_delegate_prompt` →
-//! `write_to_pane_and_submit` — and asserts the bytes that actually reach a
+//! `write_and_submit_guarded` — and asserts the bytes that actually reach a
 //! worker pane's PTY plus the contents of the generated task file.
 //!
 //! No LLM and no real agent: the worker pane is a `cat` stub whose PTY

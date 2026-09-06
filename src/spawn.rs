@@ -706,8 +706,8 @@ pub async fn spawn(
                 // as the seam-level agreement rather than as a second place
                 // where the rule is stated differently. Registering an
                 // unretainable id would be strictly worse than skipping: the
-                // registry stores `pane_id_env = None` for it, so
-                // `write_to_pane_and_submit` could never route to the pane the
+                // registry stores `pane_id_env = None` for it, so a
+                // pane-keyed write could never route to the pane the
                 // role map claimed to have.
                 if let Some(state) = state.filter(|_| {
                     crate::agent_pty::is_valid_pane_id_env(&pane_id) || {
@@ -1307,10 +1307,11 @@ async fn deliver(
         return;
     }
     // Reviewer finding B1: the FIRST write is identity-guarded too. The plain
-    // `write_to_pane_and_submit` resolves whichever agent currently owns the
-    // pane string, and a pane id is just a string an exited agent frees for the
-    // next spawn — so after a multi-second readiness wait it could type this
-    // dispatch prompt into a replacement.
+    // `write_to_pane_and_submit` this replaced resolved whichever agent owned
+    // the pane string at write time, and a pane id is just a string an exited
+    // agent frees for the next spawn — so after a multi-second readiness wait
+    // it could type this dispatch prompt into a replacement. (Issue #917
+    // deleted that primitive, so the contrast is history, not a choice.)
     match guarded_submit(registry, pane_id, agent_id, prompt, deadline).await {
         GuardedOutcome::Written => {}
         // Issue #424 H3/H5: the FIRST write of this delivery was refused because

@@ -2211,7 +2211,8 @@ fn arm_idle_worker_watch_for_delegation(
 ///
 /// Delivery goes through the identity-guarded
 /// [`AgentPtyRegistry::write_and_submit_guarded`] rather than the unguarded
-/// `write_to_pane_and_submit`, bound to the orchestrator's registry agent id
+/// `write_to_pane_and_submit` it used to take, bound to the orchestrator's
+/// registry agent id
 /// captured at arm time (PRD #126 M1 audit finding 2). A pane id is just a
 /// string: if the orchestrator was closed and another agent — possibly from an
 /// unrelated orchestration — later took that `pane_id_env`, the unguarded write
@@ -2742,7 +2743,7 @@ struct SilenceWatch {
 
 /// PRD #249 M3: make an undelivered delegate visible instead of silent.
 ///
-/// `write_to_pane_and_submit` returning `Ok` means bytes reached a PTY, not that
+/// A pane write reporting success means bytes reached a PTY, not that
 /// an agent consumed them. Combined with a `clear = true` respawn that
 /// legitimately killed the old child, a lost prompt shows the operator a healthy
 /// card on an idle agent with no way to tell "thinking" from "never got the
@@ -3422,8 +3423,8 @@ impl SessionStartWait {
 /// ([`crate::spawn::spawn`]) to gate a freshly-spawned scheduled card's
 /// prompt delivery on the same readiness signal — hence `pub(crate)`. PRD #225
 /// M4 answers "does the scheduler want the same semantics?" with yes: a
-/// scheduled card's prompt is delivered by the identical
-/// `write_to_pane_and_submit` keystroke path into the identical PTY, so a
+/// scheduled card's prompt is delivered by the identical guarded
+/// keystroke path into the identical PTY, so a
 /// fork-time event that isn't proof of interactivity is no more usable there
 /// than on the delegate path. Both call sites therefore share
 /// [`session_start_means_ready`] rather than diverging.
@@ -4818,10 +4819,10 @@ async fn dispatch_one_owned(
                 // `should_inject_spawn_time_prompt` predicate: that one is a
                 // bool the render loop re-evaluates each frame, and this is
                 // async daemon code with no render loop. Idiomatic on this
-                // exact path — `write_to_pane_and_submit` below already
+                // exact path — the guarded write below already
                 // awaits `sleep(SUBMIT_DELAY)` internally.
                 //
-                // Not pushed down into `write_to_pane_and_submit`: that
+                // Not pushed down into the guarded write itself: that
                 // would delay every caller, including the many writes that
                 // are not post-respawn and need no gate (PRD #249 open
                 // question 2). The gate belongs to the respawn, so it lives
@@ -6586,7 +6587,7 @@ impl AppState {
     /// the daemon owns `pane_cwd_map`); the new piece is that the daemon
     /// also picks the orchestrator pane for the same orchestration and
     /// writes the "Worker {role} has completed..." feedback directly into
-    /// its PTY via [`AgentPtyRegistry::write_to_pane_and_submit`]. No broadcast hop —
+    /// its PTY via [`AgentPtyRegistry::write_and_submit_guarded`]. No broadcast hop —
     /// the bytes sit in the orchestrator pane's scrollback, surviving any
     /// number of detach/reattach cycles.
     ///

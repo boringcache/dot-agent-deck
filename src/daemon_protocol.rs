@@ -466,7 +466,7 @@ pub enum AttachRequest {
     },
     /// PRD #100: atomic write-and-submit RPC. Routes the client's
     /// `pane_id` + `text` straight to
-    /// [`crate::agent_pty::AgentPtyRegistry::write_to_pane_and_submit`]
+    /// [`crate::agent_pty::AgentPtyRegistry::write_and_submit_guarded`]
     /// on the daemon side, which holds the per-agent writer mutex across
     /// the full `payload → SUBMIT_DELAY → CR` sequence (PRD #93 round-8
     /// atomic contract). Lets a TUI client trigger the same atomic

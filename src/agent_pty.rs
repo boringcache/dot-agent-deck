@@ -1795,7 +1795,7 @@ async fn deliver_payload_and_submit(
 /// No submit delay because there is nothing to keep the terminator from fusing
 /// to: LF is not an Enter for the agents this project drives, so the pause that
 /// `SUBMIT_DELAY` exists to create has no meaning here (matching
-/// [`AgentPtyRegistry::write_to_pane_notice`]'s unguarded path).
+/// [`AgentPtyRegistry::write_notice_guarded`]'s tail).
 async fn deliver_payload_as_notice(
     w: &mut (dyn std::io::Write + Send),
     payload: &[u8],
@@ -2239,7 +2239,8 @@ struct AutomaticWrite {
     /// Issue #424 H2 (both reviewers): a [`SubmitMode::Notice`] deliberately
     /// does NOT advance it. A notice is LF-terminated, so it accumulates in the
     /// input box *above* whatever the user has typed rather than replacing it —
-    /// the documented [`AgentPtyRegistry::write_to_pane_notice`] contract. An
+    /// the documented notice contract
+    /// ([`AgentPtyRegistry::write_notice_guarded`]). An
     /// any-write clock therefore let an ordinary orchestrator notice landing
     /// between the user's draft and a later blind probe make that draft look
     /// older than our last write, and the probe then submitted draft + notice as
@@ -3415,10 +3416,14 @@ pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 
 /// Internal selector for the two public byte-write entrypoints.
 /// `Submit` is the prompt path (payload + `SUBMIT_DELAY` + `\r`);
-/// `Notice` is the visibility path (payload + `\n`, no submit). Kept
-/// private because the public API exposes the two named methods
-/// directly — see [`AgentPtyRegistry::write_to_pane_and_submit`] and
-/// [`AgentPtyRegistry::write_to_pane_notice`].
+/// `Notice` is the visibility path (payload + `\n`, no submit).
+///
+/// Issue #917: it used to select between two PUBLIC unguarded entrypoints.
+/// Both are gone from the production API — `write_to_pane_and_submit` deleted
+/// and `write_to_pane_notice` retained only as a `#[cfg(test)]` PTY fixture
+/// seam — so the modes a production build can reach are exactly the two
+/// [`AgentPtyRegistry::write_and_submit_guarded`] and
+/// [`AgentPtyRegistry::write_notice_guarded`] pass in.
 #[derive(Debug)]
 enum SubmitMode {
     Submit,
@@ -4585,7 +4590,7 @@ impl AgentPtyRegistry {
     /// Residual, deliberately out of scope here and tracked as **issue #544**: a
     /// new, DIFFERENT payload delivered into a pane holding an unsent user draft
     /// still concatenates with it — the long-documented limitation on
-    /// [`Self::write_to_pane_and_submit`] — because the alternative is the brick
+    /// every automatic payload write — because the alternative is the brick
     /// above. Both reviewers ruled it a pre-existing limitation of every
     /// automatic payload rather than a regression introduced here.
     pub fn user_typed_since_writing_payload(&self, pane_id_env: &str, text: &str) -> bool {
@@ -5239,7 +5244,7 @@ impl AgentPtyRegistry {
 
         // CodeRabbit MAJOR (PRD #93 round-9): reject the spawn if
         // another live agent already claims this `pane_id_env`.
-        // `write_to_pane_and_submit` routes by `pane_id_env`, so two agents sharing
+        // Pane-keyed writes route by `pane_id_env`, so two agents sharing
         // one id silently misroute every delegate/work-done write to
         // whichever entry `values().find(...)` happened to visit first.
         // The check sits INSIDE the post-spawn lock acquisition so the
@@ -5254,7 +5259,7 @@ impl AgentPtyRegistry {
         // so a dead-but-not-yet-reaped entry would otherwise block
         // reuse of its pane_id_env forever. The same `exited.load`
         // filter is applied across every operational lookup —
-        // `write_to_pane_and_submit`, `agent_records`, and this dup check —
+        // `writer_target_for_pane`, `agent_records`, and this dup check —
         // so the live/dead boundary stays consistent
         // (round-11 reviewer #A). Cleanup paths (`close_agent`,
         // `shutdown_all`) deliberately still touch exited entries.
@@ -5401,49 +5406,6 @@ impl AgentPtyRegistry {
         Ok(id)
     }
 
-    /// Write `text` as a submitted prompt to the PTY of the agent whose
-    /// `pane_id_env` matches `pane_id`.
-    ///
-    /// PRD #93 round-5: orchestration dispatch (delegate / work-done) now
-    /// lives on the daemon side, and routing happens via this method. The
-    /// caller (typically `AppState::handle_delegate` /
-    /// `AppState::handle_work_done` inside the daemon's hook loop) holds the
-    /// TUI's pane id, not the registry's agent id; we look up by
-    /// `pane_id_env` so the daemon can target panes without keeping a
-    /// separate pane→agent index. Bytes that land in the PTY surface as
-    /// normal terminal output in the pane's scrollback — that's the new
-    /// "journal" surface for orchestration feedback (no separate
-    /// broadcast / file cursor / buffer).
-    ///
-    /// PRD #93 round-6: the daemon must mirror the TUI's submit contract
-    /// (see [`crate::pane_input`] and `EmbeddedPaneController::write_to_pane`
-    /// in `src/embedded_pane.rs`). Just dropping the prompt bytes into the
-    /// PTY leaves them sitting in the agent TUI's input box — the worker
-    /// never starts processing until the user manually presses Enter.
-    /// So: encode the payload (raw for single-line, bracketed paste for
-    /// multi-line), flush, wait [`SUBMIT_DELAY`] so the CR isn't fused with
-    /// the preceding text into "newline-in-input", then write the CR.
-    ///
-    /// PRD #93 round-8: per-pane serialization is now enforced by holding
-    /// the agent's writer mutex across the *entire* payload + sleep + CR
-    /// sequence. Earlier rounds released the lock around the sleep so
-    /// other panes could be written to in parallel — which already worked
-    /// because each agent owns its own writer mutex — but released it for
-    /// the *same* pane too, letting two concurrent calls interleave as
-    /// `payload_A + payload_B + CR + CR` (auditor finding). `tokio::sync::Mutex`
-    /// can be held across `.await` safely, and writes to other panes use
-    /// other writer mutexes, so holding for the ~150ms `SUBMIT_DELAY`
-    /// affects only the offending pane and the deck dispatches at most
-    /// one delegate or work-done per pane at a time in practice.
-    pub async fn write_to_pane_and_submit(
-        &self,
-        pane_id: &str,
-        text: &str,
-    ) -> Result<(), AgentPtyError> {
-        self.write_to_pane_internal(pane_id, text, SubmitMode::Submit)
-            .await
-    }
-
     /// PRD #20 R20-004 (finding #3): a stable fingerprint of a delivery's
     /// identity — the (expected) target agent id, the expected hook SESSION, the
     /// pane, and the exact text. A `delivery_id` is bound to its fingerprint at
@@ -5575,7 +5537,7 @@ impl AgentPtyRegistry {
     /// resolved under the registry lock. Returns the shared writer, the target's
     /// registry id, and its `exited` liveness token so the caller can bind
     /// authorization to the EXACT identity and re-check it after acquiring the
-    /// writer. Skips exited entries (mirrors [`Self::write_to_pane_internal`]).
+    /// writer. Skips exited entries (mirrors every other operational lookup here).
     /// PRD #20 R20-006 (finding #7): the registry id of the live (non-exited)
     /// agent that CURRENTLY owns `pane_id`, or `None` if no live entry does. The
     /// attach input path calls this AFTER acquiring the target writer to
@@ -5662,8 +5624,10 @@ impl AgentPtyRegistry {
     /// PRD #20 R20-003/R20-006: atomic write-and-submit that binds delivery to an
     /// EXACT target identity and RE-VALIDATES it after acquiring that target's
     /// writer, immediately before writing — closing the liveness/rebind TOCTOU
-    /// that the plain [`Self::write_to_pane_and_submit`] leaves open (it checks
-    /// liveness, releases the state lock, then awaits a separate writer lookup).
+    /// that the plain, unguarded pane-keyed write left open (it checked liveness,
+    /// released the state lock, then awaited a separate writer lookup). Issue
+    /// #917 removed that write from the production API entirely, so this is no
+    /// longer one of two ways to reach a pane's PTY — it is the way.
     ///
     /// Flow:
     /// 1. Resolve the live target for `pane_id`; `None` → [`GuardedSend::NoLiveTarget`].
@@ -5739,7 +5703,7 @@ impl AgentPtyRegistry {
         .await
     }
 
-    /// PRD #249 M3: [`Self::write_to_pane_notice`] under
+    /// PRD #249 M3: the LF-terminated notice write under
     /// [`Self::write_and_submit_guarded`]'s identity gate — the LF-terminated
     /// visibility path, but bound to an EXACT target identity.
     ///
@@ -5916,7 +5880,7 @@ impl AgentPtyRegistry {
         // `write_to_pane_internal`'s atomic submit contract).
         //
         // PRD #249 review (finding B1): the same `pane_write` byte trace the
-        // unguarded [`Self::write_to_pane_internal`] emits, and for the same
+        // unguarded `write_to_pane_internal` emits, and for the same
         // reason — it is the surface an operator diagnosing a lost delegate is
         // told to turn on (`RUST_LOG=pane_write=trace`), and the delegate task
         // pointer now travels this path instead of that one. Emitted INSIDE the
@@ -5976,12 +5940,38 @@ impl AgentPtyRegistry {
     ///   submitted as a prompt anyway. Observed safe: TODO(M7.1) — populate
     ///   after manual test against each supported agent. Observed unsafe:
     ///   (none confirmed).
-    /// - Subsequent [`AgentPtyRegistry::write_to_pane_and_submit`] calls on
-    ///   the same pane will submit "{notice text}\n{user prompt}" together —
-    ///   the notice bytes accumulate in the agent's stdin line buffer.
+    /// - A subsequent SUBMIT-mode write on the same pane will submit
+    ///   "{notice text}\n{user prompt}" together — the notice bytes accumulate
+    ///   in the agent's stdin line buffer.
     ///
     /// Both limitations point to F11 (bus-push status delivery) as the proper
     /// long-term fix — see `audit/pre-daemon-parity-audit.md`.
+    ///
+    /// # Issue #917: `#[cfg(test)]`, and why this one survived
+    ///
+    /// **No production path may use this, and in a non-test build there is
+    /// nothing here to use.** After #617's guarded-write migration both
+    /// unguarded primitives had zero production callers but stayed `pub`, so
+    /// the type change had removed the permissive ARGUMENT and not the
+    /// permissive API: a future call site could still reach an unguarded pane
+    /// write with no compiler objection. Its sibling
+    /// `write_to_pane_and_submit` was deleted outright. This one is retained
+    /// because a PTY fixture genuinely needs an identity-free write to a pane
+    /// it is about to retire — `prompt/pane-input/033` sends the one
+    /// unsubmitted line that ends a predecessor's `read`, so the predecessor
+    /// leaves by its own front door and its record (and its seed) survive it,
+    /// which is the whole fixture. A guarded write would work there and say
+    /// something this does not: that the write was authorized.
+    ///
+    /// The `#[cfg(test)]` is the seam rather than a warning name, following
+    /// [`Self::take_pending_seed_fallback`]: gating it out of a non-test build
+    /// is what makes "no production path writes to a pane without naming who it
+    /// expects to be there" hold by construction rather than by review. Note
+    /// what that does NOT cover — integration tests under `tests/` compile
+    /// against the lib WITHOUT `cfg(test)`, so they cannot reach this either,
+    /// which is why #917 migrated `tests/e2e_delegate_work_done_chain.rs` to
+    /// the guarded call instead of exempting it.
+    #[cfg(test)]
     pub async fn write_to_pane_notice(
         &self,
         pane_id: &str,
@@ -5991,6 +5981,11 @@ impl AgentPtyRegistry {
             .await
     }
 
+    /// Issue #917: `#[cfg(test)]` with its only caller. Both public unguarded
+    /// entrypoints this served are gone from the production API (see
+    /// [`Self::write_to_pane_notice`]), and a production build reaches the PTY
+    /// only through [`Self::write_guarded`].
+    #[cfg(test)]
     async fn write_to_pane_internal(
         &self,
         pane_id: &str,
@@ -6246,7 +6241,7 @@ impl AgentPtyRegistry {
     ) -> Result<String, AgentPtyError> {
         // Step 1: atomically lift the existing entry out of the
         // registry. Holding the sync lock across the find+remove keeps
-        // a concurrent `write_to_pane_and_submit` from racing in and
+        // a concurrent pane-keyed write from racing in and
         // writing to a PTY whose child we're about to terminate (the
         // writer mutex is per-agent so concurrent writes against the
         // same `pane_id_env` are still serialized, but a write that arrived
@@ -8917,7 +8912,7 @@ mod spawn_tests {
     #[test]
     fn registry_rejects_duplicate_pane_id_env() {
         // CodeRabbit MAJOR (PRD #93 round-9): two agents must never
-        // share a `pane_id_env`. `write_to_pane_and_submit` keys off
+        // share a `pane_id_env`. A pane-keyed write keys off
         // that string, so a second spawn with the same id would silently misroute
         // every subsequent delegate/work-done write to whichever entry
         // `values().find(...)` happened to hand back first.
@@ -9997,12 +9992,17 @@ mod spawn_tests {
     }
 
     #[tokio::test]
-    async fn write_to_pane_and_submit_skips_exited_agent_and_routes_to_live_reuser() {
+    async fn guarded_submit_skips_exited_agent_and_routes_to_live_reuser() {
         // Round-11 reviewer #A: the symmetric guard for the spawn-side
         // exited filter added in round 10. Without filtering on the
-        // WRITE side, `write_to_pane_and_submit(pane_id_env=X)` could
-        // still find the dead entry first and route delegate/work-done
-        // bytes into a closed PTY whose pump thread already saw EOF.
+        // WRITE side, a pane-keyed write could still find the dead entry
+        // first and route delegate/work-done bytes into a closed PTY whose
+        // pump thread already saw EOF.
+        //
+        // Issue #917: migrated off the deleted `write_to_pane_and_submit` onto
+        // the guarded call the production paths use. The property is unchanged
+        // and now pinned where it matters — `write_guarded` resolves the pane
+        // through `writer_target_for_pane`, which applies that same filter.
         let registry = Arc::new(AgentPtyRegistry::new());
         let _dead = registry
             .spawn_agent(SpawnOptions {
@@ -10042,10 +10042,19 @@ mod spawn_tests {
         // nothing" because its writer is gone — but we CAN prove the
         // live one did receive something. The dead agent's writer
         // would error out anyway, so a misroute would surface as Err.
-        registry
-            .write_to_pane_and_submit("reuse-me", "echo round11-routing-marker")
-            .await
-            .expect("write_to_pane_and_submit to a live reuser must succeed");
+        assert_eq!(
+            registry
+                .write_and_submit_guarded(
+                    "reuse-me",
+                    "echo round11-routing-marker",
+                    &live_id,
+                    || async { true }
+                )
+                .await
+                .expect("the guarded write to a live reuser must reach the registry"),
+            GuardedSend::Applied,
+            "the pane's live occupant must be the resolved target, not the exited entry"
+        );
 
         // Allow the PTY to echo the input back into scrollback.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -10064,7 +10073,7 @@ mod spawn_tests {
         }
         assert!(
             found,
-            "write_to_pane_and_submit must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
+            "the guarded write must have landed bytes in the LIVE reuser's scrollback, not the exited entry's"
         );
 
         registry.shutdown_all();
@@ -10076,7 +10085,7 @@ mod spawn_tests {
     /// notice so the orchestrator LLM doesn't process the diagnostic
     /// as a user prompt.
     ///
-    /// Timing is the test signal: `write_to_pane_and_submit` waits
+    /// Timing is the test signal: a SUBMIT-mode write waits
     /// the full `SUBMIT_DELAY` (150 ms) between payload and CR, so
     /// the call can't return in less than that. `write_to_pane_notice`
     /// writes payload + `\n` and returns immediately. PTY line
@@ -10087,7 +10096,7 @@ mod spawn_tests {
     #[tokio::test]
     async fn write_to_pane_notice_skips_submit_delay() {
         let registry = Arc::new(AgentPtyRegistry::new());
-        let _id = registry
+        let agent_id = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/cat"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "no-submit".to_string())],
@@ -10108,14 +10117,17 @@ mod spawn_tests {
         );
 
         let start = tokio::time::Instant::now();
-        registry
-            .write_to_pane_and_submit("no-submit", "prompt")
-            .await
-            .expect("write_to_pane_and_submit");
+        assert_eq!(
+            registry
+                .write_and_submit_guarded("no-submit", "prompt", &agent_id, || async { true })
+                .await
+                .expect("guarded submit"),
+            GuardedSend::Applied
+        );
         let submit_elapsed = start.elapsed();
         assert!(
             submit_elapsed >= SUBMIT_DELAY,
-            "write_to_pane_and_submit must wait at least SUBMIT_DELAY before the CR; \
+            "a SUBMIT-mode write must wait at least SUBMIT_DELAY before the CR; \
              took {submit_elapsed:?} (< {SUBMIT_DELAY:?})"
         );
 
@@ -10196,10 +10208,13 @@ mod spawn_tests {
             .write_to_pane_notice("accumulate", "NOTICE-MARKER")
             .await
             .expect("write_to_pane_notice");
-        registry
-            .write_to_pane_and_submit("accumulate", "USER-PROMPT")
-            .await
-            .expect("write_to_pane_and_submit");
+        assert_eq!(
+            registry
+                .write_and_submit_guarded("accumulate", "USER-PROMPT", &agent_id, || async { true })
+                .await
+                .expect("guarded submit"),
+            GuardedSend::Applied
+        );
 
         // Master scrollback should contain the exact byte sequence
         // the daemon wrote: `NOTICE-MARKER\nUSER-PROMPT\r` (raw cat
@@ -10312,10 +10327,10 @@ mod spawn_tests {
     }
 
     #[test]
-    fn registry_write_to_pane_and_submit_routes_to_correct_agent_by_pane_id() {
+    fn registry_pane_keyed_write_routes_to_correct_agent_by_pane_id() {
         // CodeRabbit MAJOR (PRD #93 round-9) regression guard: with
-        // distinct pane_id_envs, `write_to_pane_and_submit(pane_id,
-        // bytes)` must land in *that* agent's PTY and not leak into a sibling.
+        // distinct pane_id_envs, a pane-keyed write must land in *that*
+        // agent's PTY and not leak into a sibling.
         // Mirrors the production routing path delegate/work-done uses.
         // We can't easily read PTY bytes from a `/bin/sh` so we
         // confirm structurally: the registry must contain both agents
