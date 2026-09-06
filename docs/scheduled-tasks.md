@@ -305,4 +305,10 @@ enabled = true
 
 ### Hand-editing the file
 
-The TOML is human-readable; edit `~/.config/dot-agent-deck/schedules.toml` directly (see the [reference](#the-global-config-file) below for the format), then run `dot-agent-deck schedule reload` (or just let the next daemon start pick it up).
+The TOML is human-readable; edit `~/.config/dot-agent-deck/schedules.toml` directly (see [the global config file](#the-global-config-file) above for the format). A running daemon will not notice on its own — **the deck has no "re-read the file" action** — so a hand-edit takes effect either on the next daemon start, or immediately if you run:
+
+```bash
+dot-agent-deck schedule reload
+```
+
+That is the only reason a command appears in this section. Editing through the deck needs none, because the agent's write triggers the reload for you.
