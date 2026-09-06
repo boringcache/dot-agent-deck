@@ -12448,25 +12448,46 @@ mod spawn_tests {
         }
     }
 
-    /// Scenario: A pane has a native seed stashed and its PTY-injection safety
-    /// net armed for the agent the seed was stashed for; inside the grace the
-    /// pane changes hands — that agent goes away and a new one inherits the same
-    /// `DOT_AGENT_DECK_PANE_ID` and stashes a seed of its own. When the armed
-    /// fallback fires it must be refused as `WrongSession` with the seed dropped
-    /// rather than restored, and none of the seed's bytes may reach the
-    /// successor, whose scrollback still shows a later authorized write.
+    /// Scenario: a pane has a native seed stashed for its occupant and that
+    /// agent's PTY-injection safety net armed; inside the grace the occupant
+    /// exits on its own — keeping its record — and a new agent claims the same
+    /// `DOT_AGENT_DECK_PANE_ID` without stashing a seed of its own. When the
+    /// armed fallback fires it takes the seed it is entitled to (its own), the
+    /// identity gate must refuse the injection as `WrongSession`, and that seed
+    /// must be dropped rather than restored anywhere the new occupant could pull
+    /// it, with none of its bytes reaching the successor — whose scrollback still
+    /// shows a later authorized write.
     #[spec("prompt/pane-input/033")]
     #[tokio::test]
     async fn pane_input_033_seed_fallback_is_refused_when_the_pane_changed_hands() {
         const PANE: &str = "seed-fallback-handover-pane";
         const SEED: &str = "STASHED-SEED-MUST-NOT-BE-TYPED-BY-A-STRANGERS-TASK-8e42";
         const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-1f56";
-        const GRACE: Duration = Duration::from_millis(200);
+        // Still a PARAMETER, so the 15 s default and its second-granularity
+        // `DOT_AGENT_DECK_SEED_FALLBACK_SECS` env var are both out of the
+        // picture — but an order of magnitude larger than `prompt/pane-input/034`'s,
+        // because this hand-over waits on a child exiting and its reader thread
+        // seeing EOF rather than on a synchronous `close_agent`. The hand-over
+        // must complete inside it; if it ever does not, the two log assertions
+        // below say which side of it the fallback fired on rather than failing
+        // opaquely.
+        const GRACE: Duration = Duration::from_millis(1500);
 
         let registry = Arc::new(AgentPtyRegistry::new());
+        // The predecessor exits on its OWN — its `read` returns on the line
+        // written below — rather than through `close_agent`, and that is the
+        // whole fixture. `close_agent` REMOVES the record, so the expiring
+        // fallback would find no seed of ITS OWN to take
+        // (`SeedFallbackTake::Absent`) and would never reach the identity gate
+        // at all. A natural exit RETAINS the record flagged `exited`, which is
+        // also what lets a successor claim the same pane id (`spawn_agent`'s
+        // duplicate check skips exited entries), so the seed stashed for the
+        // departed agent is still that agent's own seed when its timer fires.
+        // A write-level refusal needs a predecessor whose record — and so whose
+        // own seed — outlives it; `close_agent` leaves neither.
         let original = registry
             .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
+                command: Some("sh -c 'read _line'"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
                 ..SpawnOptions::default()
             })
@@ -12482,23 +12503,30 @@ mod spawn_tests {
         let subscriber_guard = tracing::subscriber::set_default(subscriber);
 
         // Armed for the agent that owns the pane RIGHT NOW, exactly as the two
-        // production callers arm it at spawn/respawn time. `grace` is a
-        // parameter, so the 15 s default and its second-granularity env var are
-        // both out of the picture.
+        // production callers arm it at spawn/respawn time.
         arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
 
-        // The hand-over, inside the grace. The seed store is keyed by PANE and
-        // the original's record goes with it, so the seed the fallback finds
-        // when it fires is the SUCCESSOR'S OWN — stashed by its own spawn, as
-        // production stashes one. That is what makes the pre-fix behaviour
-        // harmful rather than merely wrong: a task nobody authorized consumes
-        // the new occupant's seed and presses Enter on it, before the
-        // occupant's own native `get-seed` pull could take it. The successor's
-        // own fallback is deliberately NOT armed here, so the ONLY thing that
-        // could type this seed into its PTY is the original's armed task.
+        // The hand-over, inside the grace. One unsubmitted line ends the
+        // predecessor's `read`, so it leaves by its own front door: no
+        // `close_agent`, no kill, and therefore a record that survives it.
         registry
-            .close_agent(&original)
-            .expect("close the agent the seed was stashed for");
+            .write_to_pane_notice(PANE, "the line that ends the predecessor's read")
+            .await
+            .expect("the line that retires the predecessor must reach its PTY");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.pane_is_live(PANE) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !registry.pane_is_live(PANE),
+            "the fixture needs the predecessor gone before a successor can claim the pane id"
+        );
+        assert!(
+            registry.agent_record_any(&original).is_some(),
+            "…and it must have gone by EXITING, which retains its record: a removed record holds \
+             no seed, so the fallback would find nothing of its own and never reach the write"
+        );
+
         let successor = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/cat"),
@@ -12510,7 +12538,14 @@ mod spawn_tests {
             original, successor,
             "the hand-over must produce a NEW registry agent id"
         );
-        registry.set_pending_seed(PANE, SEED);
+        // The successor deliberately stashes NOTHING. The seed the expiring
+        // fallback finds must be the departed agent's own, so the take hands it
+        // over and the refusal happens at the WRITE — which is the half of the
+        // property this test owns. `prompt/pane-input/034` stages the other
+        // half: a successor that HAS stashed one, where the refusal happens at
+        // the take and nothing is removed. The successor's own fallback is
+        // deliberately NOT armed either, so the ONLY thing that could type this
+        // seed into its PTY is the original's armed task.
 
         // Wait for the armed task to reach a terminal report rather than for a
         // fixed multiple of the grace.
@@ -12535,11 +12570,19 @@ mod spawn_tests {
              refusal must be WrongSession — anything else means the fixture never got the \
              hand-over it needed; captured log = {log:?}"
         );
-        assert!(
-            registry.take_pending_seed_fallback(PANE).is_none(),
-            "the refused seed must be DROPPED, not restored: left in the store it stays pullable \
-             by the new occupant's own `get-seed`, re-opening the mis-delivery by the native \
-             route after the injection route refused it"
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &original),
+            SeedFallbackTake::Absent,
+            "the refused seed must be DROPPED rather than restored to the record it was stashed \
+             on: nothing re-arms this fallback, so a restored seed is one no delivery path will \
+             ever come back for"
+        );
+        assert_eq!(
+            registry.take_pending_seed_fallback_for(PANE, &successor),
+            SeedFallbackTake::Absent,
+            "and it must not have been re-filed under the pane's NEW occupant either — there it \
+             would be pullable by that occupant's own `get-seed`, re-opening the mis-delivery by \
+             the native route after the injection route refused it"
         );
 
         // A barrier, not a sleep: an AUTHORIZED write that has demonstrably
