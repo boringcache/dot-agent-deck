@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 #
-# Whole-box sampler for a measured-task run (issue #906).
+# Whole-box sampler for a task-cost measurement run (issue #906).
+#
+# Protocol: docs/develop/measuring-task-cost.md
 #
 # Run by the COORDINATOR, not by a measuring agent. An agent can see only its
 # own processes; at N>1 the numbers that matter -- total memory across every

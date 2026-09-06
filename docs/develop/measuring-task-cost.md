@@ -1,14 +1,10 @@
----
-name: measured-task
-description: Do a normal piece of work in this repo while measuring what it costs — wall clock AND resources (peak RSS, I/O, PSI pressure, link-gate queueing) — and post the numbers to a tracking issue. Use when asked to measure the cost of a task, benchmark the gates, price the developer workflow, or run one level of a concurrency-scaling experiment. It does not replace the task's own rules; it adds an instrumentation duty on top of them.
-user-invocable: true
----
-
-# measured-task
+# Measuring what a task costs
 
 Do the work normally. Measure what it costs. Post the numbers.
 
-This skill carries the **durable protocol**. The task itself — which issue, which shape, which concurrency level — comes from whoever invoked it and stays short.
+This page is the **durable protocol** for issue #906's cost measurements. The task itself — which issue, which shape, which concurrency level — comes from whoever dispatched the run and stays short.
+
+It is a reference, deliberately not a skill: a skill's description is injected into every session's context (the 38 existing ones already cost ~10.7 KB before any work starts), and this serves a bounded experiment plus the occasional "did that change make things faster" question. Both are deliberately initiated, so nothing needs to discover it unprompted. Developer docs under `docs/develop/` are excluded from the Docusaurus build (CLAUDE.md rule 11), so this never reaches the public site.
 
 ## The prime directive
 
@@ -16,7 +12,7 @@ This skill carries the **durable protocol**. The task itself — which issue, wh
 
 ## Why resources, not just wall clock
 
-Issue #863 measured this project's build storm as `io full avg300=65.95`, `dm-0` at 100% utilisation, 22 concurrent linkers, and `ld` invoking the OOM killer — while `cpu some avg300=0.08`. **The CPU was idle throughout.** A time-and-CPU-only measurement would have concluded nothing was wrong, on the very incident that produced `scripts/link-gate.sh`. So capture I/O and memory pressure alongside duration. The write-up is [`docs/develop/build-gate.md`](../../../docs/develop/build-gate.md).
+Issue #863 measured this project's build storm as `io full avg300=65.95`, `dm-0` at 100% utilisation, 22 concurrent linkers, and `ld` invoking the OOM killer — while `cpu some avg300=0.08`. **The CPU was idle throughout.** A time-and-CPU-only measurement would have concluded nothing was wrong, on the very incident that produced `scripts/link-gate.sh`. So capture I/O and memory pressure alongside duration. The write-up is [`build-gate.md`](build-gate.md).
 
 ## The one instruction people get wrong
 
@@ -56,7 +52,7 @@ The single most useful number the #749 run produced: **41% of its local gate wal
 
 When the invocation names a level (N=1, N=3, N=5):
 
-- **Report only your own processes.** Do not attempt machine-wide claims — with several agents running you cannot see the box, and an inference will be wrong. Whole-box state (PSI, `MemAvailable`, load, disk, total RSS, pool occupancy) is captured separately by `sample-box.sh`, run by the coordinator, and correlated with your gates by timestamp. This is why UTC timestamps are mandatory.
+- **Report only your own processes.** Do not attempt machine-wide claims — with several agents running you cannot see the box, and an inference will be wrong. Whole-box state (PSI, `MemAvailable`, load, disk, total RSS, pool occupancy) is captured separately by [`scripts/sample-box.sh`](../../scripts/sample-box.sh), run by the coordinator, and correlated with your gates by timestamp. This is why UTC timestamps are mandatory.
 - **`time -v`'s max RSS is the largest single process, not a sum.** At N>1 total memory is the binding constraint and only the box sampler can see it. Do not present your peak as the machine's.
 - **Record your own start time** so "N=3" means three agents actually overlapping, rather than one finishing before another began.
 
