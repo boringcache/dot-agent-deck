@@ -2163,6 +2163,18 @@ struct ConfirmationTask {
     deadline: Instant,
 }
 
+/// One in-flight confirmation watch: the handle that cancels it, and the prompt
+/// whose payload record its [`PayloadRecordRelease`] holds.
+///
+/// Issue #617 (auditor finding 1): the prompt is carried so a canceller can
+/// finish the abort DETERMINISTICALLY — releasing one record of exactly the
+/// bytes this watch was going to release — instead of guessing at "the oldest
+/// matching record on the pane". See [`cancel_prompt_confirmation`].
+struct ConfirmationWatch {
+    handle: tokio::task::AbortHandle,
+    prompt: String,
+}
+
 /// Issue #424, reviewer finding B9 / auditor MEDIUM: the confirmation tasks
 /// currently holding a spawn-time prompt provisional, keyed by pane id.
 ///
@@ -2170,7 +2182,7 @@ struct ConfirmationTask {
 /// rebound agent or a daemon shutdown was noticed only when a later write
 /// happened to fail, and repeated dispatch into one pane could accumulate
 /// tasks. This map gives all of that one home.
-static CONFIRMATION_TASKS: std::sync::LazyLock<Mutex<HashMap<String, tokio::task::AbortHandle>>> =
+static CONFIRMATION_TASKS: std::sync::LazyLock<Mutex<HashMap<String, ConfirmationWatch>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Ceiling on concurrently-live confirmation tasks across the daemon.
@@ -2214,7 +2226,7 @@ fn spawn_confirmation_task(
     // itself: self-deregistration races its own registration (a fast task can
     // finish before the handle is filed) and would leak the entry it could not
     // find. `is_finished` needs no such coordination.
-    tasks.retain(|_, handle| !handle.is_finished());
+    tasks.retain(|_, watch| !watch.handle.is_finished());
     if tasks.len() >= MAX_CONFIRMATION_TASKS && !tasks.contains_key(&pane_id) {
         drop(tasks);
         log_prompt_unconfirmable(
@@ -2246,32 +2258,47 @@ fn spawn_confirmation_task(
     }
     // Held across `tokio::spawn`, which is synchronous — no await, so a `std`
     // mutex is safe here.
+    let prompt = task.prompt.clone();
     let handle = tokio::spawn(confirm_prompt_delivery(registry, rx, task));
-    if let Some(previous) = tasks.insert(pane_id, handle.abort_handle()) {
-        previous.abort();
+    if let Some(previous) = tasks.insert(
+        pane_id,
+        ConfirmationWatch {
+            handle: handle.abort_handle(),
+            prompt,
+        },
+    ) {
+        previous.handle.abort();
     }
 }
 
 /// Cancel the confirmation loop watching `pane_id`, if any. Called when the
 /// pane closes: the prompt's target no longer exists, so neither the retries
 /// nor the abandonment notice have anywhere to go.
-pub fn cancel_prompt_confirmation(pane_id: &str) {
-    if let Some(handle) = CONFIRMATION_TASKS.lock().unwrap().remove(pane_id) {
-        handle.abort();
-    }
+///
+/// Returns the prompt the cancelled watch was delivering, so a caller that
+/// needs the abort to be DETERMINISTIC can release that watch's payload record
+/// itself. `AbortHandle::abort` only schedules the cancellation, so the
+/// [`PayloadRecordRelease`] the watch holds is dropped at the runtime's
+/// convenience — possibly after the caller's own next write has already
+/// consulted the guard. `None` means there was no watch on this pane and the
+/// caller is therefore entitled to release nothing.
+pub fn cancel_prompt_confirmation(pane_id: &str) -> Option<String> {
+    let watch = CONFIRMATION_TASKS.lock().unwrap().remove(pane_id)?;
+    watch.handle.abort();
+    Some(watch.prompt)
 }
 
 /// Cancel every confirmation loop. Called on daemon shutdown, so a prompt watch
 /// cannot outlive the daemon that owns the PTY it is writing into.
 pub fn cancel_all_prompt_confirmations() {
-    let handles: Vec<_> = CONFIRMATION_TASKS
+    let watches: Vec<_> = CONFIRMATION_TASKS
         .lock()
         .unwrap()
         .drain()
-        .map(|(_, handle)| handle)
+        .map(|(_, watch)| watch)
         .collect();
-    for handle in handles {
-        handle.abort();
+    for watch in watches {
+        watch.handle.abort();
     }
 }
 
@@ -2775,23 +2802,43 @@ async fn deliver_on_idle(
     //   still be retrying that fire's prompt into this same pane. That is
     //   `spawn_confirmation_task`'s own per-pane single-flight rule ("a newer
     //   prompt for the same pane cancels the older watch rather than racing
-    //   it"), applied from the reuse path, which never went through it. It also
-    //   stops #424 S2's hazard: releasing the older record below would otherwise
-    //   disarm a still-live delivery's guard and let ITS replacement land on top
-    //   of the user's draft.
-    // * the RELEASE is the deterministic half. Aborting a task only drops it at
-    //   the runtime's convenience, so the record it holds cannot be relied on to
-    //   be gone by the time the write below runs. `note_payload_settled` removes
-    //   exactly ONE record (the oldest matching one, #424 S2) and is a no-op when
-    //   there is none, so calling it here and letting the aborted watch's own RAII
-    //   release run too is safe in either order.
+    //   it"), applied from the reuse path, which never went through it.
+    // * the RELEASE is the deterministic half OF THAT CANCEL, and nothing more.
+    //   `AbortHandle::abort` only schedules the cancellation, so the
+    //   `PayloadRecordRelease` the aborted watch holds is dropped at the
+    //   runtime's convenience and cannot be relied on to have run by the time
+    //   the write below consults the guard. Doing it here, and letting the
+    //   abort's own RAII release run too, is safe in either order because
+    //   `note_payload_settled` removes exactly ONE record (#424 S2) and is a
+    //   no-op when there is none. It is the CANCEL that makes it safe at all:
+    //   #424 S2's hazard is disarming a guard a still-live delivery is relying
+    //   on, and the delivery this releases for is the one the line above just
+    //   aborted. Narrowly, `note_payload_settled` releases the OLDEST record
+    //   carrying these bytes rather than that watch's own by construction —
+    //   the same record unless some other delivery of the same bytes into this
+    //   same pane is still on record and older.
     //
-    // What this does NOT do is exempt the reuse path from F1 generally: this
-    // fire's own record, written a few lines below, still guards it, and a user
-    // draft typed after THIS write still refuses the NEXT fire until this one is
-    // settled.
-    cancel_prompt_confirmation(pane_id);
-    registry.note_payload_settled(pane_id, prompt);
+    // Issue #617 (auditor finding 1): the release is CONDITIONAL on this fire
+    // having actually cancelled a watch for THESE bytes, and that condition is
+    // the whole point. An unconditional pre-write release would also remove a
+    // record no watch owns — in particular the one a PREVIOUS fire's
+    // `Ambiguous` write deliberately left standing, whose meaning is "half this
+    // prompt may still be sitting in the input box". Releasing that would let
+    // this fire write and submit the full prompt on top of the leftover bytes
+    // AND whatever the user has typed since, as one turn: exactly the #424 F1
+    // hazard, and exactly the #424 S2 hazard of consuming a record this path
+    // did not create. `deliver_on_idle` registers no watch of its own, so after
+    // an `Ambiguous` fire there is nothing to cancel, `cancelled` is `None`,
+    // the standing record survives, and the next fire is refused with `Stale`
+    // and zero bytes — the same direction `settle_silence_report_payload_record`
+    // takes for the one-shot silence report.
+    //
+    // So this path is NOT exempt from F1: a user draft typed after a fire whose
+    // write did not settle the input box still refuses the next fire.
+    let cancelled = cancel_prompt_confirmation(pane_id);
+    if cancelled.as_deref() == Some(prompt) {
+        registry.note_payload_settled(pane_id, prompt);
+    }
     match registry
         .write_and_submit_guarded(pane_id, prompt, expected_agent_id, || async { true })
         .await
@@ -4956,7 +5003,13 @@ mod tests {
             let mut tasks = CONFIRMATION_TASKS.lock().unwrap();
             for index in 0..MAX_CONFIRMATION_TASKS {
                 let pending = tokio::spawn(std::future::pending::<()>());
-                tasks.insert(format!("cap-fill-{index}"), pending.abort_handle());
+                tasks.insert(
+                    format!("cap-fill-{index}"),
+                    ConfirmationWatch {
+                        handle: pending.abort_handle(),
+                        prompt: format!("cap-fill-prompt-{index}"),
+                    },
+                );
             }
         }
         let (cap_tx, cap_rx) = broadcast::channel(1);

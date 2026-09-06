@@ -4704,6 +4704,23 @@ async fn dispatch_one_owned(
                     };
                     match notice_outcome {
                         Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                        // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous`
+                        // is NOT a refusal and must not be logged as one. It means
+                        // some notice bytes DID reach the authorized agent and the
+                        // trailing LF did not complete, so "the failure stays in
+                        // this log only" would be false — the operator can see a
+                        // truncated notice in the scrollback. Not retried, for the
+                        // same reason the submit sites do not retry it: a repeat
+                        // would append the whole notice to the fragment already
+                        // there. A notice appends an LF and never submits, so the
+                        // fragment cannot become a turn on its own.
+                        Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
+                            pane_id = %orchestrator_pane_id,
+                            role = %target_role,
+                            "delegate: the dead-replacement notice was written only partially \
+                             (ambiguous); not retried, so the orchestrator pane may show a \
+                             truncated notice"
+                        ),
                         Ok(refused) => warn!(
                             pane_id = %orchestrator_pane_id,
                             role = %target_role,
@@ -5078,6 +5095,18 @@ async fn dispatch_one_owned(
                 };
                 match notice_outcome {
                     Ok(crate::agent_pty::GuardedSend::Applied) => {}
+                    // Issue #617 (reviewer S1 / auditor finding 2): `Ambiguous`
+                    // is NOT a refusal — some notice bytes reached the authorized
+                    // agent — so it gets its own arm rather than being logged as
+                    // "nothing was written". See the dead-replacement arm above for
+                    // why it is not retried.
+                    Ok(crate::agent_pty::GuardedSend::Ambiguous) => warn!(
+                        pane_id = %orchestrator_pane_id,
+                        role = %target_role,
+                        "delegate: the respawn-failure notice was written only \
+                         partially (ambiguous); not retried, so the orchestrator \
+                         pane may show a truncated notice"
+                    ),
                     Ok(refused) => warn!(
                         pane_id = %orchestrator_pane_id,
                         role = %target_role,
@@ -6684,21 +6713,43 @@ impl AppState {
         // `orchestrator_for_worker` just resolved: two different routes to "the
         // orchestrator" must agree before one is used to authorize the other.
         //
+        // Issue #617 (auditor finding 3): DISAGREEMENT REFUSES. It used to fall
+        // through to the weaker route, which fails OPEN in the one case the
+        // agreement rule exists for — the worker's `pane_orchestration_map` entry
+        // was re-homed between the delegate and this completion, so the pane the
+        // routing lookup just produced is not the pane that commissioned the work.
+        // The report still carries the `Filed` (solicited) head, so the fallback
+        // delivered a completion an orchestrator never asked for, presented as one
+        // it did, while the conversation that DID commission it got nothing.
+        // Dropping it costs a lost report in a case that is already a mis-route;
+        // delivering it costs a forged solicitation.
+        //
         // The fallback — the pane's CURRENT live agent, resolved immediately
-        // before the call — is deliberately weaker, and it is what an UNSOLICITED
-        // completion gets, because there is no commissioning delegation to name an
-        // identity. It does not prove the recipient is the conversation that asked
-        // for anything (nothing asked), but it does bind the write to a concrete
-        // agent, so the primitive's post-lock re-validation still refuses a pane
-        // that changes hands between here and the write. An orchestrator pane with
-        // no live agent yields no identity at all and the feedback is dropped into
-        // this log, which is the same outcome the unguarded write reached by
-        // failing.
+        // before the call — is therefore reserved for the genuinely UNSOLICITED
+        // arm, where there is no commissioning delegation to name an identity at
+        // all. It is deliberately weaker: it does not prove the recipient is the
+        // conversation that asked for anything (nothing asked), but it does bind
+        // the write to a concrete agent, so the primitive's post-lock
+        // re-validation still refuses a pane that changes hands between here and
+        // the write. An orchestrator pane with no live agent yields no identity at
+        // all and the feedback is dropped into this log, which is the same outcome
+        // the unguarded write reached by failing.
         let expected_orchestrator_agent_id = match commissioning_orchestrator {
             Some((commissioned_pane, commissioned_agent)) if commissioned_pane == orch_pane_id => {
                 Some(commissioned_agent)
             }
-            _ => registry.pane_current_agent_id(&orch_pane_id),
+            Some((commissioned_pane, _)) => {
+                warn!(
+                    pane_id = %signal.pane_id,
+                    role = %role_name,
+                    commissioned_orchestrator_pane = %commissioned_pane,
+                    routed_orchestrator_pane = %orch_pane_id,
+                    "work-done: the delegation was commissioned by a different orchestrator pane \
+                     than the one this completion routed to; nothing written"
+                );
+                return;
+            }
+            None => registry.pane_current_agent_id(&orch_pane_id),
         };
         let Some(expected_orchestrator_agent_id) = expected_orchestrator_agent_id else {
             warn!(

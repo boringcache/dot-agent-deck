@@ -1184,16 +1184,25 @@ async fn compute_write_and_submit_outcome(
             // rather than forwarding an `Option`.
             //
             // Issue #617 made that a TYPE rather than a local invariant:
-            // `write_and_submit_guarded` takes a `&str`, so this `expect` is the
-            // only place the refusal above has to be re-stated, and the calls
-            // below could not forward an `Option` even if this block regressed.
-            // The early refusal is kept as the cheaper, better-reported gate —
-            // it answers `SendResult::NoLiveTarget` without touching the
-            // registry — not because the primitive still needs it.
-            let agent_id = extras
-                .expected_agent_id
-                .clone()
-                .expect("a Live target implies an expected agent id");
+            // `write_and_submit_guarded` takes a `&str`, so this is the only
+            // place the refusal above has to be re-stated, and the calls below
+            // could not forward an `Option` even if this block regressed. The
+            // early refusal is kept as the cheaper, better-reported gate — it
+            // answers `SendResult::NoLiveTarget` without touching the registry —
+            // not because the primitive still needs it.
+            //
+            // Issue #617 (auditor finding 5): this `Option → &str` conversion
+            // is load-bearing, so it REFUSES rather than panicking. It cannot
+            // fire today — `Writable::Live` is producible only from the
+            // `Some(agent_id)` arm above and `extras` is not mutated in between
+            // — but it runs inside a connection-handling task, where the
+            // residual failure mode of an `expect` is an aborted attach
+            // connection rather than a refused write. Failing closed costs
+            // nothing and answers with the same `SendResult::NoLiveTarget` the
+            // resolution block above already gives an identity-less request.
+            let Some(agent_id) = extras.expected_agent_id.clone() else {
+                return Ok(SendResult::NoLiveTarget);
+            };
             let guarded = if is_paneless {
                 // A paneless target is re-validated by agent identity (mirroring
                 // STREAM_IN). `<no-pane>` has no pane→hook-session mapping, so the
