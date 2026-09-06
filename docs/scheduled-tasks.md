@@ -17,7 +17,7 @@ Each task pairs a **schedule** (when it runs) with a **working directory and a p
 
 **Do this in the deck.** Open the **Scheduled Tasks** dialog, and an authoring agent writes the entry for you — you describe the job in plain English instead of getting cron syntax, TOML quoting and flag names right by hand.
 
-The [reference section](#reference) below documents the file format and the `schedule` CLI. You need neither to use this feature: they are there for reading back what the agent wrote, for scripting, and for a machine with no TUI in front of it.
+The [reference section](#reference) below documents the on-disk file the agent writes. You do not need it to use this feature — it is there so you can read back what was written, and know the vocabulary (`cron`, `working_dir`, `shape`, …) to ask for what you want.
 
 ### The Scheduled Tasks dialog
 
@@ -46,7 +46,9 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 
 **What the dialog deliberately does not do.** There is **no in-place field editing** and **no inline enable/disable toggle** — that keeps the terminal dialog simple. **Rename is forbidden** on the edit path because `name` is the reuse-tab key; to rename, delete and add.
 
-That leaves one gap worth naming: **pausing a schedule has no button.** Ask the authoring agent to do it, or run [`schedule disable`](#the-schedule-cli) yourself. The five things you are most likely to want — creating, editing, deleting, firing now, and seeing what is scheduled — are all keys in this dialog.
+That leaves one gap worth naming: **pausing a schedule has no button.** Everything else you are likely to want — creating, editing, deleting, firing now, and seeing what is scheduled — is a key in this dialog, but flipping a task's `enabled` flag is not. Ask an agent to pause it for you, or set `enabled = false` in the [config file](#the-global-config-file).
+
+Pausing is not the same as deleting: **`[Delete d]` discards the definition** — prompt, cron, directory and all — while pausing keeps it and simply stops it firing, which is what you want for a schedule you are going away from or debugging.
 
 ### What the authoring agent does
 
@@ -134,7 +136,7 @@ max_per_run = 5                       # hard cap on how many issues a single fir
 >
 > Unlike a plain scheduled task, an `issue_dispatch` task does **not** need a `command`. The per-issue agent command is resolved at fire time: if the cloned repo defines an `[[orchestrations]]` block the dispatch opens an **orchestration tab** (the orchestration's role commands win); otherwise it opens a **single-agent card** running your [`default_command`](configuration.md#default-command) (which falls back to `claude` when unset).
 
-Rather than hand-write the sub-table, you can author the same task with the validated CLI — pass `--repo` (and the optional `--max-per-run` / `--label` / `--query`) and omit `--command`:
+**This is the one place on this page where you may have to run a command yourself.** The guided authoring option for issue-dispatch tasks (the `schedule: issues` entry in the new-pane cycler) sits behind the `experimental` flag, so with the flag off there is no agent-driven door for this task type — only the sub-table above, hand-written, or the CLI below. It takes `--repo` plus the optional `--max-per-run` / `--label` / `--query`, and needs no `--command`:
 
 ```bash
 dot-agent-deck schedule add \
@@ -250,7 +252,7 @@ enabled = true
 
 ## Reference
 
-You do not need this section to create or manage a schedule — the deck and its authoring agent cover that. It is here for four things: **reading back** what the agent wrote, **scripting** schedule changes, **pausing** a task (the one action with no button), and working on a machine where the TUI is not running.
+You do not need this section to create or manage a schedule — the deck and its authoring agent cover that, and the agent writes this file for you. It is here so you can **read back** what it wrote, **know the field names** well enough to ask for what you want, and **hand-edit** when you would rather.
 
 ### The global config file
 
@@ -300,65 +302,6 @@ enabled = true
 > **Local time & daylight saving**
 >
 > Cron is evaluated in the host's **local time** — there is no timezone field. At a daylight-saving transition this means a fire may be **skipped** (the spring-forward hour never occurs) or **run twice** (the fall-back hour repeats). This is an accepted tradeoff of local-time scheduling; if you need exactness across a DST boundary, avoid scheduling inside the transition hour.
-
-### The `schedule` CLI
-
-This is the interface the authoring agent uses on your behalf — it never edits the TOML directly — so every guarantee below (cron validation, path expansion, atomic write, daemon reload) applies whether the agent runs the command or you do.
-
-Run it yourself when you want to script a change, inspect or fire a task from a terminal, or **pause one** — `enable` / `disable` is the single operation the dialog does not offer.
-
-```bash
-# Add a task (validated, then saved to the global file). --command is REQUIRED:
-dot-agent-deck schedule add \
-  --name morning-digest \
-  --cron "0 9 * * MON-FRI" \
-  --working-dir ~/scheduled/morning-digest \
-  --command claude \
-  --prompt "Generate the morning brief. Notify when done." \
-  --enabled true
-
-# Force ONE agent even though the working dir defines [[orchestrations]]:
-dot-agent-deck schedule add \
-  --name pr-sweep \
-  --cron "0 9 * * *" \
-  --working-dir ~/code/dot-agent-deck \
-  --command claude \
-  --prompt "Triage the open PRs." \
-  --shape single
-
-# Update fields of an existing task (no --new-name; rename is forbidden):
-dot-agent-deck schedule update --name morning-digest --cron "0 8 * * MON-FRI"
-
-# Change the shape of an existing task, or clear it back to config-derived:
-dot-agent-deck schedule update --name pr-sweep --shape orchestration:review
-dot-agent-deck schedule update --name pr-sweep --shape ""
-
-# Pause / resume without deleting:
-dot-agent-deck schedule disable --name morning-digest
-dot-agent-deck schedule enable  --name morning-digest
-
-# Inspect:
-dot-agent-deck schedule list
-
-# Fire now, or ask a running daemon to re-read the file:
-dot-agent-deck schedule run-now --name morning-digest
-dot-agent-deck schedule reload
-
-# Remove the definition (does NOT close an open tab for the task):
-dot-agent-deck schedule remove --name morning-digest
-```
-
-| Subcommand | Purpose |
-|---|---|
-| `add` | Append a new task. **`--command` is required** (no `$SHELL` fallback). |
-| `update` | Change fields of an existing task by `name`. No rename. |
-| `remove` | Delete a task **definition** (leaves any open tab alive). |
-| `list` | Show each task with its enabled/disabled state and next-fire time. |
-| `enable` / `disable` | Flip `enabled` without deleting the definition. |
-| `run-now` | Fire the task immediately via the running daemon. |
-| `reload` | Tell the running daemon to re-read `schedules.toml`. |
-
-After any command that changes a task, the CLI tells a running daemon to reload, so it picks the change up immediately. If no daemon is running that's fine — the change loads on the next `daemon serve`.
 
 ### Hand-editing the file
 
