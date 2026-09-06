@@ -1413,14 +1413,19 @@ async fn compute_write_and_submit_outcome(
                         // process, so the witness map and the id space reset
                         // together.
                         //
-                        // It FAILS OPEN where the evidence is absent.
+                        // It FAILS OPEN where the evidence is absent, twice.
                         // `AgentEvent::agent_id` is an `Option` and an external
                         // producer (or one that lost `DOT_AGENT_DECK_AGENT_ID`)
                         // carries `None`, so no witness is recorded for it and
-                        // this arm accepts exactly as it did before — a
-                        // degradation to the previous behaviour, which is the
-                        // right default, and a documented limit rather than a
-                        // guarantee.
+                        // this arm accepts exactly as it did before; and an
+                        // ending event whose named agent the registry cannot
+                        // confirm holds the named pane records nothing either
+                        // (round-2 audit finding 1 — otherwise a forged
+                        // `SessionEnd` on an invented pane could refuse a
+                        // third party's deliveries here). Both are degradations
+                        // to the previous behaviour, which is the right
+                        // default, and both are documented limits rather than
+                        // guarantees.
                         match expected_session.as_deref() {
                             Some(expected) => match guard.pane_hook_session_id(&pane_for_check) {
                                 Some(current) if current != expected => return false,
@@ -3804,6 +3809,162 @@ mod tests {
             "the departed agent's witness must not be inherited by whoever takes its pane id \
              — a pane-keyed witness would refuse this, and every later occupant, for the \
              daemon's remaining lifetime"
+        );
+
+        reg.shutdown_all();
+    }
+
+    /// Issue #915 round-2 audit (finding 1) — a `SessionEnd` a same-uid process
+    /// FORGES for a pane it invented cannot witness against a victim agent that
+    /// sits on a different pane.
+    ///
+    /// The chain this closes, and every step of it is reachable over the
+    /// unauthenticated hook socket: a `SessionStart` for an invented pane id no
+    /// registry claims auto-registers that pane into `managed_pane_ids`
+    /// (`AppState::apply_event`'s startup-race escape hatch); `managed_pane_ids`
+    /// is permanent, so the NEXT event for that pane is admitted by the
+    /// pane-scoped ground without the generation check looking at who sent it;
+    /// and the `SessionEnd` branch then recorded the ended-generation witness
+    /// against whatever `agent_id` the event named. Naming a victim on another
+    /// pane therefore refused that victim's every later unnamed automatic
+    /// delivery for the daemon's remaining lifetime — and registry ids are
+    /// sequential decimals from `"1"`, so the whole id space is one pass.
+    ///
+    /// The witness is now recorded only where the registry confirms the named
+    /// agent holds the named pane — or where no oracle was installed at all,
+    /// the TUI's configuration, which reads this map back nowhere — so the
+    /// forgery records nothing. The forged
+    /// `SessionEnd` is still ADMITTED — narrowing that is `managed_pane_ids`'s
+    /// pre-existing bearer-token shape (#601) and out of scope here — which is
+    /// exactly why this asserts on the witness and on the delivery rather than
+    /// on admission.
+    ///
+    /// Unix-gated: it spawns a real PTY running `/bin/sh`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_forged_cross_pane_session_end_cannot_witness_against_its_victim() {
+        fn frame(
+            pane: &str,
+            session: &str,
+            agent: Option<&str>,
+            event_type: crate::event::EventType,
+            secs: i64,
+        ) -> crate::event::AgentEvent {
+            crate::event::AgentEvent {
+                session_id: session.to_string(),
+                agent_type: crate::event::AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+                    + chrono::TimeDelta::seconds(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane.to_string()),
+                agent_id: agent.map(|a| a.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let victim_pane = "pane-forged-witness-victim";
+        let invented_pane = "pane-forged-witness-invented";
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        // The registry IS the ownership authority, and installing it is what
+        // makes this test the daemon's configuration rather than the TUI's — a
+        // bare `AppState` has no oracle, so it cannot tell a forged pane from a
+        // real one and deliberately keeps the historical pane-set rule.
+        {
+            let ownership: Arc<dyn crate::state::AgentOwnership> = reg.clone();
+            let mut guard = state.write().await;
+            guard.set_agent_ownership(Arc::downgrade(&ownership));
+            guard.register_pane(victim_pane.to_string());
+        }
+
+        let victim = reg
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/sh"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), victim_pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the victim agent");
+
+        // Step 1: the forger establishes a pane nothing owns. This is admitted
+        // (the startup-race hatch) and is the pre-existing shape the fix does
+        // not try to close.
+        state.write().await.apply_event(frame(
+            invented_pane,
+            "forged-generation",
+            None,
+            crate::event::EventType::SessionStart,
+            1,
+        ));
+        assert_eq!(
+            state
+                .read()
+                .await
+                .pane_hook_session_id(invented_pane)
+                .as_deref(),
+            Some("forged-generation"),
+            "precondition: the forged SessionStart must have established a generation on the \
+             invented pane — without it the SessionEnd below never reaches the witness at all, \
+             and the test would pass for the wrong reason"
+        );
+
+        // Step 2: end that generation while naming the VICTIM, who sits on a
+        // pane this event never mentions.
+        state.write().await.apply_event(frame(
+            invented_pane,
+            "forged-generation",
+            Some(&victim),
+            crate::event::EventType::SessionEnd,
+            2,
+        ));
+        {
+            let guard = state.read().await;
+            assert!(
+                guard.pane_hook_session_id(invented_pane).is_none(),
+                "precondition: the forged end must have been ADMITTED and cleared its own \
+                 pane's generation — this test is about what it may WITNESS, not about \
+                 admission"
+            );
+            assert_eq!(
+                guard.pane_generation_closures(invented_pane),
+                1,
+                "precondition: the pane-keyed counter still counts it, on the forger's own \
+                 invented pane, which is where a pane-local poison stays"
+            );
+            assert!(
+                !guard.agent_generation_ended(&victim),
+                "a SessionEnd for a pane the named agent does not hold must witness NOTHING \
+                 against that agent"
+            );
+        }
+
+        // And the effect that would have had: the victim never announced a
+        // generation of its own, so it is exactly the sessionless agent the
+        // carve-out protects, and its unnamed automatic delivery must still land.
+        assert_eq!(
+            compute_write_and_submit_outcome(
+                &reg,
+                &state,
+                victim_pane,
+                "printf 'VICTIM-IS-STILL-DELIVERABLE\\n'",
+                &WriteAndSubmitExtras {
+                    expected_agent_id: Some(victim.clone()),
+                    expected_session_id: None,
+                    ..Default::default()
+                },
+            )
+            .await,
+            Ok(crate::event::SendResult::Applied),
+            "a forged end on somebody else's pane must not cost the victim its unnamed \
+             automatic deliveries — permanently, which is what made this worth fixing rather \
+             than documenting"
         );
 
         reg.shutdown_all();

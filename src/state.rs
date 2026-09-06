@@ -1208,13 +1208,17 @@ pub struct AppState {
     /// `AppState` is in-memory and dies with that process, so the map and the id
     /// space reset together.
     ///
-    /// FAILS OPEN when the evidence is absent: `AgentEvent::agent_id` is an
-    /// `Option` and events from external agents (or any producer that lost
+    /// FAILS OPEN when the evidence is absent, in two ways. `AgentEvent::agent_id`
+    /// is an `Option` and events from external agents (or any producer that lost
     /// `DOT_AGENT_DECK_AGENT_ID` on the way) carry `None`, so no witness is
-    /// recorded and the carve-out accepts the write exactly as it did before.
-    /// That is a degradation to the previous behaviour rather than a new hole,
-    /// and it is the right default — the alternative refuses the very agents the
-    /// carve-out exists for — but it is a documented limit, not a guarantee.
+    /// recorded and the carve-out accepts the write exactly as it did before;
+    /// and (round-2 audit finding 1) an event whose named agent the registry
+    /// cannot confirm holds the named pane records nothing either. Both are
+    /// degradations to the previous behaviour rather than new holes, and both
+    /// are the right default — the alternative refuses the very agents the
+    /// carve-out exists for, and lets a forged event refuse them on somebody
+    /// else's behalf — but they are documented limits, not guarantees. See
+    /// [`Self::apply_event`]'s `SessionEnd` branch for the ownership check.
     ///
     /// Monotonic per agent, `u64`, in memory only; it grows by one per real
     /// conversation end, bounded by the agents this daemon ever spawned.
@@ -7429,16 +7433,61 @@ impl AppState {
                 // [`Self::pane_generation_closures`].
                 self.note_generation_closed(pane_id);
                 // Issue #915 (finding 4): the same transition, recorded against
-                // the AGENT that ended rather than against the pane it was
-                // sitting on. The daemon's write guard needs this to tell a
-                // just-ended conversation from an agent that never had one —
+                // the AGENT the ending event names rather than against the pane
+                // it was sitting on. The daemon's write guard needs this to tell
+                // a just-ended conversation from an agent that never had one —
                 // both of which leave `pane_hook_session` empty from here on.
                 // Keyed by agent because the pane-keyed counter above is never
                 // cleaned up on pane recycle, so reading THAT one here would
                 // refuse a genuinely sessionless successor forever. See
                 // [`Self::agent_generation_closures`]; a producer that named no
                 // agent id records nothing and the guard keeps its carve-out.
-                if let Some(agent_id) = event.agent_id.as_deref() {
+                //
+                // ROUND-2 AUDIT (finding 1): the named id is not taken at face
+                // value, and that check is the whole difference between a
+                // witness and a weapon. `owns_pane_event` admits an event whose
+                // pane is merely in `managed_pane_ids`, and an entry there is
+                // itself establishable by posting a `SessionStart` for an
+                // INVENTED pane id ([`Self::apply_event`]'s `SessionStart`
+                // branch inserts one when no oracle claims the pane). So without
+                // this, any same-uid process holding the hook socket could post
+                // a `SessionEnd` for a pane it invented while naming a VICTIM
+                // agent that sits on a different pane, and the victim's every
+                // later unnamed automatic delivery would be refused for as long
+                // as this daemon runs. Registry ids are sequential decimal
+                // strings from `"1"`, so the whole live id space is one pass —
+                // and future agents can be poisoned before they spawn.
+                //
+                // [`crate::event`]'s own doctrine is the fix: provenance is
+                // established by the DAEMON, at the site that acts on it. The
+                // witness is recorded only where the registry confirms that this
+                // agent holds this pane — the binding `generation_ownership`
+                // already computes and the `registration_admits` fallback
+                // deliberately does not enforce. It costs nothing on the honest
+                // path: a real `SessionEnd` from a real agent on its own pane is
+                // [`Ownership::Owned`].
+                //
+                // [`Ownership::Unclaimed`] and [`Ownership::Unknown`] record
+                // NOTHING. This effect is adverse to the agent it names, so
+                // absence of evidence must not grant it, and withholding the
+                // witness degrades to exactly the fail-open the absent-`agent_id`
+                // case already takes.
+                //
+                // A `None` oracle is a different answer from `Unclaimed` and is
+                // deliberately admitted: it means no oracle was installed AT ALL
+                // — the TUI and every bare-[`AppState`] test — where the
+                // historical pane-set rule stands in full and nothing reads this
+                // map. Both of the daemon's serving paths install it before they
+                // accept anything (`crate::daemon::run_daemon_with` ahead of its
+                // hook loop, `crate::daemon_protocol::serve_attach_with_counter`
+                // ahead of its accept loop, idempotently), so in the daemon this
+                // is an ownership check and not the historical fallback.
+                if let Some(agent_id) = event.agent_id.as_deref()
+                    && matches!(
+                        self.oracle_ownership(Some(pane_id.as_str()), Some(agent_id)),
+                        None | Some(Ownership::Owned)
+                    )
+                {
                     self.note_agent_generation_closed(agent_id);
                 }
             }
