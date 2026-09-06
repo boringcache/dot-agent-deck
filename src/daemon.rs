@@ -2045,10 +2045,25 @@ async fn run_hook_loop(
                                     // won't also deliver it. `take_..._native`
                                     // marks the delivery as native for the
                                     // real-pi e2e proof. `None` → `{"seed":null}`.
-                                    let seed =
-                                        pty_registry.take_pending_seed_native(&req.pane_id);
+                                    //
+                                    // Issue #916: the pane id is CALLER-SUPPLIED
+                                    // and this socket authenticates nobody, so
+                                    // the take is scoped by the caller's own
+                                    // agent id when it presents one and skips
+                                    // exited records either way — the filtering
+                                    // every other registry lookup applies and
+                                    // this one did not. `req.agent_id` is
+                                    // `None` for a caller the daemon injected no
+                                    // id into, which falls back to the pane's
+                                    // live occupant; the reasoning for that
+                                    // choice is on `take_pending_seed_native_for`.
+                                    let seed = pty_registry.take_pending_seed_native_for(
+                                        &req.pane_id,
+                                        req.agent_id.as_deref(),
+                                    );
                                     info!(
                                         pane_id = %req.pane_id,
+                                        agent_id = ?req.agent_id,
                                         has_seed = seed.is_some(),
                                         "Received get-seed request"
                                     );
@@ -3231,12 +3246,19 @@ mod hook_ingestion_tests {
     /// seed, mark it delivered-native, and clear it — a second request replies
     /// `{"seed":null}`. This is the request/response path the pi extension's
     /// `get-seed` verb rides (the one hook-socket message that reads a reply).
+    ///
+    /// Issue #916 added the identity arms, over the real socket rather than
+    /// against the registry method: a request naming an agent that does not hold
+    /// the pane gets `null` and consumes nothing, a request naming the pane's own
+    /// agent is answered, and a request naming NO agent — the pre-#916 client, and
+    /// any producer the daemon injected no id into — is still answered rather than
+    /// refused.
     #[tokio::test]
     async fn run_hook_loop_answers_get_seed_and_clears_it() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let registry = Arc::new(AgentPtyRegistry::new());
-        registry
+        let agent_gs = registry
             .spawn_agent(SpawnOptions {
                 command: Some("/bin/sh"),
                 env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-gs".to_string())],
@@ -3265,9 +3287,17 @@ mod hook_ingestion_tests {
         });
 
         // Helper: send one get_seed request line and read the single reply line.
-        async fn ask_get_seed(sock: &std::path::Path, pane_id: &str) -> String {
+        // `agent_id` is what the real CLI reads out of `DOT_AGENT_DECK_AGENT_ID`
+        // (issue #916); `None` is the pre-#916 client, and the shape a producer
+        // the daemon injected no id into still sends.
+        async fn ask_get_seed_as(
+            sock: &std::path::Path,
+            pane_id: &str,
+            agent_id: Option<&str>,
+        ) -> String {
             let req = crate::event::DaemonMessage::GetSeed(crate::event::GetSeedRequest {
                 pane_id: pane_id.to_string(),
+                agent_id: agent_id.map(|a| a.to_string()),
             });
             let line = format!("{}\n", serde_json::to_string(&req).unwrap());
             let mut stream = UnixStream::connect(sock).await.expect("connect");
@@ -3279,8 +3309,24 @@ mod hook_ingestion_tests {
             buf
         }
 
+        // Issue #916: a pull that NAMES an agent which does not hold this pane
+        // is refused, and refused without consuming anything — the seed is still
+        // there for its owner two blocks down. Asserted first for that reason:
+        // after a successful pull there is nothing left to prove it did not eat.
+        let stranger = ask_get_seed_as(&sock, "pane-gs", Some("agent-999")).await;
+        let stranger_resp: crate::event::GetSeedResponse =
+            serde_json::from_str(stranger.trim()).expect("parse stranger get-seed reply");
+        assert!(
+            stranger_resp.seed.is_none(),
+            "a pull naming an agent that does not hold this pane must get nothing"
+        );
+        assert!(
+            !registry.seed_delivered_native("pane-gs"),
+            "…and must not have consumed the seed on its way to being refused"
+        );
+
         // First pull: the daemon returns the seed…
-        let reply = ask_get_seed(&sock, "pane-gs").await;
+        let reply = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs)).await;
         let resp: crate::event::GetSeedResponse =
             serde_json::from_str(reply.trim()).expect("parse get-seed reply");
         assert_eq!(
@@ -3294,7 +3340,7 @@ mod hook_ingestion_tests {
         );
 
         // Second pull: nothing left — the seed was delivered exactly once.
-        let reply2 = ask_get_seed(&sock, "pane-gs").await;
+        let reply2 = ask_get_seed_as(&sock, "pane-gs", Some(&agent_gs)).await;
         let resp2: crate::event::GetSeedResponse =
             serde_json::from_str(reply2.trim()).expect("parse second get-seed reply");
         assert!(
@@ -3302,11 +3348,31 @@ mod hook_ingestion_tests {
             "seed must be cleared after the first pull"
         );
 
-        // Unknown pane → null, harmless.
-        let reply3 = ask_get_seed(&sock, "pane-unknown").await;
+        // Issue #916: the pre-#916 / id-less client still works. It presents no
+        // agent id, and the take falls back to the pane's LIVE occupant rather
+        // than refusing — the decision recorded on `take_pending_seed_native_for`.
+        registry.set_pending_seed("pane-gs", "a second opening task");
+        let legacy = ask_get_seed_as(&sock, "pane-gs", None).await;
+        let legacy_resp: crate::event::GetSeedResponse =
+            serde_json::from_str(legacy.trim()).expect("parse id-less get-seed reply");
+        assert_eq!(
+            legacy_resp.seed.as_deref(),
+            Some("a second opening task"),
+            "a caller the daemon injected no agent id into must not lose its seed"
+        );
+
+        // Unknown pane → null, harmless, whether or not an id is presented.
+        let reply3 = ask_get_seed_as(&sock, "pane-unknown", None).await;
         let resp3: crate::event::GetSeedResponse =
             serde_json::from_str(reply3.trim()).expect("parse unknown-pane get-seed reply");
         assert!(resp3.seed.is_none());
+        let reply4 = ask_get_seed_as(&sock, "pane-unknown", Some(&agent_gs)).await;
+        let resp4: crate::event::GetSeedResponse =
+            serde_json::from_str(reply4.trim()).expect("parse cross-pane get-seed reply");
+        assert!(
+            resp4.seed.is_none(),
+            "an agent naming a pane it does not hold must get nothing"
+        );
 
         handle.abort();
         let _ = handle.await;

@@ -1113,6 +1113,13 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            // Issue #916: present our own registry agent id so the daemon can
+            // scope the take by identity instead of trusting the pane id alone.
+            // Optional for the same reason the `agent-event` verb's is — the
+            // daemon injects it at spawn, and a producer that never got one
+            // sends nothing rather than failing. An older daemon ignores the
+            // field; the take then falls back to the pane's live occupant.
+            let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID).ok();
             // Ask the daemon (over the hook socket) for the seed it prepared
             // for this pane. READ-ONLY request/response — the one hook-socket
             // verb that reads a reply. A missing daemon / older daemon that
@@ -1121,7 +1128,7 @@ fn main() -> ExitCode {
             // still delivers (graceful cross-version degradation, no
             // PROTOCOL_VERSION dependency).
             let req = dot_agent_deck::event::DaemonMessage::GetSeed(
-                dot_agent_deck::event::GetSeedRequest { pane_id },
+                dot_agent_deck::event::GetSeedRequest { pane_id, agent_id },
             );
             let json = match serde_json::to_string(&req) {
                 Ok(j) => j,

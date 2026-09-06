@@ -7513,13 +7513,12 @@ impl AgentPtyRegistry {
     /// a seed filed on an exited record can never reach the agent it was meant
     /// for — that agent is gone — so the filter costs no legitimate stash.
     ///
-    /// It does NOT make an exited record's own leftover seed unreachable:
-    /// [`AgentPtyRegistry::take_pending_seed_native`] still resolves a pane by
-    /// unfiltered scan, so a `get-seed` pull can still land on a dead
+    /// The matching reader was the other half, and issue #916 closed it in the
+    /// same PR: [`AgentPtyRegistry::take_pending_seed_native`] resolved a pane
+    /// by UNFILTERED scan, so a `get-seed` pull could land on a dead
     /// predecessor's record and hand its stale seed to the pane's new occupant.
-    /// That reader is issue #916 and is deliberately untouched here; what
-    /// changes is only that the successor's own seed is no longer filed where
-    /// the predecessor's expiring fallback would consume it.
+    /// It now applies the same `exited` filter, and additionally scopes the take
+    /// by the caller's own agent id when the caller presents one.
     pub fn set_pending_seed(&self, pane_id_env: &str, seed: &str) {
         if pane_id_env.is_empty() || seed.trim().is_empty() {
             return;
@@ -7534,11 +7533,96 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #201: take (clear) the pending seed for `pane_id_env` on behalf of
-    /// the NATIVE `get-seed` pull. Marks the seed as delivered natively so a
+    /// the NATIVE `get-seed` pull, **scoped to the agent asking for it when the
+    /// caller could say who that is**. Marks the seed as delivered natively so a
     /// test can prove the native path ran. Returns `None` when the pane is
     /// unknown or has no pending seed (already delivered, or never set). The
     /// take is atomic under the registry lock, so a race with the fallback
     /// path can only let one of them win.
+    ///
+    /// **Issue #916: the two filters, and they carry different weight.**
+    ///
+    /// The `exited` filter is the load-bearing half and closes the actually
+    /// reachable window. An agent that exits on its OWN keeps its record until
+    /// something reaps it (`close_agent` REMOVES it, so a deliberately-closed
+    /// agent's seed goes with it), while the spawn-side duplicate check lets a
+    /// SUCCESSOR claim the same `pane_id_env` because that check skips exited
+    /// entries. In that window two records carry this pane id, `agents` is a
+    /// `HashMap` with an unspecified iteration order, and the unfiltered scan
+    /// this replaces could hand the successor its predecessor's seed. Skipping
+    /// exited entries is also what every other operational lookup in this
+    /// registry already does — [`Self::writer_target_for_pane`],
+    /// [`Self::pane_current_agent_id`], [`Self::agent_records`] and the
+    /// duplicate check itself — and this path was the outlier.
+    ///
+    /// `expected_agent_id` is defence in depth on top of that, not a
+    /// replacement for it. With the `exited` filter the pane-keyed resolution is
+    /// already UNIQUE: `spawn_agent` refuses a second live agent on a
+    /// `pane_id_env` under the same lock acquisition as the insert, so at most
+    /// one live record ever answers to a pane id. What the identity adds is
+    /// refusing a pull that names an agent which does not hold this pane — a
+    /// stale environment surviving a respawn, or a caller reading somebody
+    /// else's pane id — and making the invariant explicit rather than resting on
+    /// the duplicate check continuing to hold.
+    ///
+    /// **An absent `expected_agent_id` FALLS BACK to the pane's live occupant
+    /// rather than refusing, deliberately.** Refusing would cost a seed for
+    /// every producer the daemon did not inject an id into, and the repo already
+    /// takes this decision the same way one layer over — `generation_ownership`
+    /// keeps the id-less shape working on purpose (PRD #110 / issue #398) and
+    /// answers from the pane alone. The residual exposure is narrow because of
+    /// the uniqueness above: an id-less pull still cannot reach an exited
+    /// record. It is not zero — an id-less caller that presents a pane id it
+    /// does not own is still answered — but an id is an env var, so requiring
+    /// one would not have stopped that caller either; it would only have stopped
+    /// the honest one.
+    ///
+    /// The `Option` here is NOT the permissive argument issue #617 removed from
+    /// the write side. There, `None` silently SKIPPED the identity comparison
+    /// and wrote into whichever agent held the pane. Here nothing is skipped:
+    /// both arms apply the `exited` filter, and with that filter the pane
+    /// resolves to at most one live record, so the `None` arm is a complete
+    /// resolution rather than an abandoned check. It is also a read of the
+    /// caller's own pane, not a write into somebody's conversation.
+    ///
+    /// Named `_for` to match [`Self::take_pending_seed_fallback_for`], whose
+    /// pane-keyed predecessor this mirrors. [`Self::take_pending_seed_native`]
+    /// is retained as the `#[cfg(test)]` probe, for the same reason its sibling
+    /// keeps one.
+    pub fn take_pending_seed_native_for(
+        &self,
+        pane_id_env: &str,
+        expected_agent_id: Option<&str>,
+    ) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        let agent = match expected_agent_id {
+            // Keyed lookup, then confirm the record really holds this pane and
+            // is still live. A record is keyed by agent id for the whole of its
+            // life, so this cannot wander onto a namesake pane's newer occupant.
+            Some(id) => inner.agents.get_mut(id).filter(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })?,
+            None => inner.agents.values_mut().find(|a| {
+                a.pane_id_env.as_deref() == Some(pane_id_env) && !a.exited.load(Ordering::SeqCst)
+            })?,
+        };
+        let seed = agent.pending_seed.take()?;
+        agent.seed_delivered_native = true;
+        Some(seed)
+    }
+
+    /// Test probe for the NATIVE pull, ignoring identity AND liveness: takes
+    /// whatever seed the first record matching `pane_id_env` holds, and marks it
+    /// delivered natively.
+    ///
+    /// `#[cfg(test)]` on purpose, and the reason is
+    /// [`Self::take_pending_seed_fallback`]'s: this is the pane-keyed take that
+    /// issue #916 replaced with [`Self::take_pending_seed_native_for`], kept only
+    /// so tests can observe the pane's slot the way an extension would, and
+    /// gating it out of a non-test build is what makes "no production path hands
+    /// out a seed off an exited record, or off a record the caller does not
+    /// name" hold by construction rather than by review.
+    #[cfg(test)]
     pub fn take_pending_seed_native(&self, pane_id_env: &str) -> Option<String> {
         let mut inner = self.inner.lock().unwrap();
         let agent = inner
@@ -7548,6 +7632,25 @@ impl AgentPtyRegistry {
         let seed = agent.pending_seed.take()?;
         agent.seed_delivered_native = true;
         Some(seed)
+    }
+
+    /// Read-only test probe for ONE agent's seed slot, keyed by agent id and
+    /// consuming nothing.
+    ///
+    /// Issue #916: the pane-keyed probes above are a linear scan over a
+    /// `HashMap`, so while two records carry the same `pane_id_env` — the whole
+    /// window this issue is about — which of them they answer for is
+    /// unspecified. A test that has to establish "the departed agent's seed is
+    /// STILL SITTING THERE", so that a refusal is meaningful rather than vacuous,
+    /// cannot ask a pane-keyed reader that question. This can answer it.
+    #[cfg(test)]
+    pub fn peek_pending_seed_of_agent(&self, agent_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|a| a.pending_seed.clone())
     }
 
     /// PRD #201: take (clear) the pending seed for `pane_id_env` on behalf of
@@ -8965,6 +9068,168 @@ mod spawn_tests {
         registry.set_pending_seed("pane-unknown", "orphan");
         assert_eq!(registry.take_pending_seed_native("pane-unknown"), None);
         assert!(!registry.seed_delivered_native("pane-unknown"));
+
+        registry.shutdown_all();
+    }
+
+    /// Issue #916: the NATIVE pull must not hand out a seed off a dead
+    /// predecessor's record, and must not hand out a seed to a caller naming an
+    /// agent that does not hold the pane.
+    ///
+    /// The reachable window is specifically SELF-EXIT then successor.
+    /// `close_agent` REMOVES the record, so a deliberately-closed agent's seed
+    /// goes with it; an agent that exits on its own KEEPS its record flagged
+    /// `exited`, and the spawn-side duplicate check skips exited entries, so a
+    /// successor can claim the same `pane_id_env` while both records still carry
+    /// it. `agents` is a `HashMap` with an unspecified iteration order, so the
+    /// unfiltered scan this replaced picked between them arbitrarily — which is
+    /// why the probe below (which is still unfiltered, deliberately) is used to
+    /// show the predecessor's seed is genuinely still sitting there.
+    #[tokio::test]
+    async fn native_seed_pull_skips_an_exited_record_and_a_stranger() {
+        const PANE: &str = "pane-native-seed-handover";
+        const PREDECESSOR_SEED: &str = "PREDECESSORS-SEED-MUST-NOT-BE-HANDED-OVER-3c17";
+        const SUCCESSOR_SEED: &str = "SUCCESSORS-OWN-SEED-51b8";
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        // `read` returns when the line below lands, so this agent leaves by its
+        // own front door and RETAINS its record.
+        let predecessor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'read _line'"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the predecessor");
+        registry.set_pending_seed(PANE, PREDECESSOR_SEED);
+
+        registry
+            .write_notice_guarded(
+                PANE,
+                "the line that ends the read",
+                &predecessor,
+                || async { true },
+            )
+            .await
+            .expect("the retiring line must reach the predecessor's PTY");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while registry.pane_is_live(PANE) && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !registry.pane_is_live(PANE),
+            "the fixture needs the predecessor gone before a successor can claim the pane id"
+        );
+        assert!(
+            registry.agent_record_any(&predecessor).is_some(),
+            "…and gone by EXITING, which RETAINS the record holding its seed — a removed \
+             record would make this fixture vacuous"
+        );
+
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the successor");
+        assert_ne!(predecessor, successor, "the hand-over must mint a new id");
+
+        // The seed is still physically in the predecessor's record, so every
+        // refusal below is refused rather than answered-with-nothing. Asserted
+        // by an AGENT-keyed peek: the pane-keyed probe is a linear scan over a
+        // `HashMap`, and with two records carrying this pane id which one it
+        // answers for is unspecified — so it cannot establish this.
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&predecessor).as_deref(),
+            Some(PREDECESSOR_SEED),
+            "fixture: the exited predecessor must still be holding its seed, or the refusals \
+             below are vacuous"
+        );
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&successor),
+            None,
+            "fixture: nothing is stashed for the successor yet"
+        );
+
+        // The successor's own pull: nothing is stashed for it yet. Refused by
+        // IDENTITY — the keyed lookup lands on the successor's own record.
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&successor)),
+            None,
+            "the exited predecessor's seed must not be handed to the pane's new occupant"
+        );
+        // The departed agent pulling its OWN seed. Refused by the `exited`
+        // filter and by nothing else: its record still names this pane and still
+        // holds that seed.
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&predecessor)),
+            None,
+            "an exited record must not answer a pull even for the agent that owns it"
+        );
+        // The id-less arm over the same window — the pre-#916 client, and the
+        // case #916 named as reachable: two records carry this pane id, so the
+        // unfiltered linear scan could return either. The `exited` filter is the
+        // whole of what makes this deterministic.
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, None),
+            None,
+            "an id-less pull must resolve to the pane's LIVE occupant, which has no seed yet — \
+             never to the exited record that still carries the pane id"
+        );
+        assert!(
+            !registry.seed_delivered_native(PANE),
+            "none of those refusals may mark a delivery"
+        );
+        // …and none of them touched what they refused to hand over.
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&predecessor).as_deref(),
+            Some(PREDECESSOR_SEED),
+            "a refused pull must leave the seed it refused exactly where it was"
+        );
+
+        // Now a seed of the successor's own, to pin that the refusals are about
+        // WHO is asking and not about the slot being unreadable. `set_pending_seed`
+        // files on the pane's LIVE occupant, so this lands on the successor and the
+        // predecessor keeps holding its own.
+        registry.set_pending_seed(PANE, SUCCESSOR_SEED);
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&successor).as_deref(),
+            Some(SUCCESSOR_SEED),
+            "fixture: the successor's seed must be on the successor's record"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&predecessor)),
+            None,
+            "the departed agent must not be able to pull the successor's seed either"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some("agent-no-such")),
+            None,
+            "an unknown agent id resolves to no record at all"
+        );
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, Some(&successor)),
+            Some(SUCCESSOR_SEED.to_string()),
+            "…and none of those refusals may have consumed the successor's own seed"
+        );
+
+        // The id-less arm, positively: answered off the live occupant. Note the
+        // predecessor is STILL holding its own seed at this point, so this also
+        // pins that the id-less arm reaches past an exited record rather than
+        // merely finding it empty.
+        assert_eq!(
+            registry.peek_pending_seed_of_agent(&predecessor).as_deref(),
+            Some(PREDECESSOR_SEED),
+            "fixture: the exited record must still be occupied for the arm below to mean \
+             anything"
+        );
+        registry.set_pending_seed(PANE, "a later opening task");
+        assert_eq!(
+            registry.take_pending_seed_native_for(PANE, None),
+            Some("a later opening task".to_string()),
+            "a caller that could not name itself must still get its own pane's seed"
+        );
 
         registry.shutdown_all();
     }
