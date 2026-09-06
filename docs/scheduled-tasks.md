@@ -13,92 +13,15 @@ Each task pairs a **schedule** (when it runs) with a **working directory and a p
 >
 > Scheduling runs inside the long-lived **daemon**, not the TUI, so fires keep happening after you close the deck window. While the daemon is stopped nothing fires — and a fire that comes due during the downtime is **not** run later (there is no catch-up) — but your schedules **resume on the next daemon start**, because their definitions live on disk. See [Daemon must be running](#daemon-must-be-running).
 
-## Creating a scheduled task
+## Creating and managing schedules
 
-You can create and edit schedules three ways, listed below easiest-first.
+**Do this in the deck.** Open the **Scheduled Tasks** dialog, and an authoring agent writes the entry for you — you describe the job in plain English instead of getting cron syntax, TOML quoting and flag names right by hand.
 
-### 1. Agent-driven authoring (primary)
+The [reference section](#reference) below documents the file format and the `schedule` CLI. You need neither to use this feature: they are there for reading back what the agent wrote, for scripting, and for a machine with no TUI in front of it.
 
-The easiest door: converse with an agent that builds the entry and runs the commands for you. There are two ways in, and both open the same guided authoring session:
+### The Scheduled Tasks dialog
 
-- **From the new-deck / new-pane dialog** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked as an *authoring session*).
-- **From the Scheduled Tasks dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). This now mirrors the `Ctrl+n` flow: first a **directory picker** (the dir you choose becomes the authoring session's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring session in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
-
-Either way a throwaway authoring session opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
-
-- asks you for the fields (name, cron, working dir, command, prompt, …);
-- asks for the **command that launches your agent** — it must result in a `claude`, `opencode`, `pi`, `codex`, or `devin` process, either directly (`claude`, `claude --model opus`, `opencode --model gpt-4o`, `pi`, `codex`, `devin`) or via a project wrapper that ends up launching one (`devbox run agent-new`, `npm run agent`). Those are the CLIs the deck integrates with for **live status tracking**; a command that doesn't result in one still runs but gets no status tracking, so the agent won't suggest unrelated CLIs (e.g. `gemini`). The command is **required** (there is no `$SHELL` fallback);
-- lets you **test the prompt in the same session** ("run it now, show me") before committing;
-- **confirms the full entry** with you, then calls `schedule add` (or `schedule update` on the edit path).
-
-The agent writes the entry for you, so you don't have to get the cron syntax or prompt formatting right by hand. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **appears live in its own pane** on the deck, while an orchestration-targeted run opens in its tab when the deck is (re)opened.
-
-This is also where the [management dialog](#management-the-scheduled-tasks-dialog) sends you for **add** and **edit**.
-
-### 2. The `schedule` CLI
-
-Scriptable, and the fast path for trivial edits:
-
-```bash
-# Add a task (validated, then saved to the global file). --command is REQUIRED:
-dot-agent-deck schedule add \
-  --name morning-digest \
-  --cron "0 9 * * MON-FRI" \
-  --working-dir ~/scheduled/morning-digest \
-  --command claude \
-  --prompt "Generate the morning brief. Notify when done." \
-  --enabled true
-
-# Force ONE agent even though the working dir defines [[orchestrations]]:
-dot-agent-deck schedule add \
-  --name pr-sweep \
-  --cron "0 9 * * *" \
-  --working-dir ~/code/dot-agent-deck \
-  --command claude \
-  --prompt "Triage the open PRs." \
-  --shape single
-
-# Update fields of an existing task (no --new-name; rename is forbidden):
-dot-agent-deck schedule update --name morning-digest --cron "0 8 * * MON-FRI"
-
-# Change the shape of an existing task, or clear it back to config-derived:
-dot-agent-deck schedule update --name pr-sweep --shape orchestration:review
-dot-agent-deck schedule update --name pr-sweep --shape ""
-
-# Pause / resume without deleting:
-dot-agent-deck schedule disable --name morning-digest
-dot-agent-deck schedule enable  --name morning-digest
-
-# Inspect:
-dot-agent-deck schedule list
-
-# Fire now, or ask a running daemon to re-read the file:
-dot-agent-deck schedule run-now --name morning-digest
-dot-agent-deck schedule reload
-
-# Remove the definition (does NOT close an open tab for the task):
-dot-agent-deck schedule remove --name morning-digest
-```
-
-| Subcommand | Purpose |
-|---|---|
-| `add` | Append a new task. **`--command` is required** (no `$SHELL` fallback). |
-| `update` | Change fields of an existing task by `name`. No rename. |
-| `remove` | Delete a task **definition** (leaves any open tab alive). |
-| `list` | Show each task with its enabled/disabled state and next-fire time. |
-| `enable` / `disable` | Flip `enabled` without deleting the definition. |
-| `run-now` | Fire the task immediately via the running daemon. |
-| `reload` | Tell the running daemon to re-read `schedules.toml`. |
-
-After any command that changes a task, the CLI tells a running daemon to reload, so it picks the change up immediately. If no daemon is running that's fine — the change loads on the next `daemon serve`.
-
-### 3. Hand-edit the file
-
-The TOML is human-readable; edit `~/.config/dot-agent-deck/schedules.toml` directly (see the [reference](#reference-the-global-config-file) below for the format), then run `dot-agent-deck schedule reload` (or just let the next daemon start pick it up).
-
-## Management: the "Scheduled Tasks" dialog
-
-Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Scheduled Tasks** manager — your one place to see and manage every schedule. Its **`[Scheduled Tasks s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. The dialog lists your schedules and lets you act on them, but you don't edit fields inside it — changes flow through the authoring agent, the CLI, or the file.
+Press **`s`** on the dashboard (lowercase; the legacy uppercase **`S`** also works) to open the **Scheduled Tasks** manager — your one place to see and manage every schedule. Its **`[Scheduled Tasks s]`** button is **always present on the dashboard**: it doesn't wait for a schedule to exist, because the manager's **`[Add]`** action is itself how you create the first one. You never type field values into the dialog itself — **`[Add]`** and **`[Edit]`** hand you to the authoring agent described below, which does the writing for you.
 
 Rows are **click-selectable**. Each row shows the task **name**, a **status** indicator, and its **next-fire** time:
 
@@ -121,58 +44,27 @@ Actions — the footer buttons mirror the keys, shown as `[Add a]` `[Edit e]` `[
 
 **Edits take effect on the next fire.** Change a schedule's prompt — or any field that affects a fire (cron, working dir, command, `new_tab_per_fire`) — and the next fire uses the new values, not the ones from when you first created the task.
 
-There is deliberately **no inline enable/disable toggle** and **no in-place field editing** — that keeps the terminal dialog simple. Pause a task via the agent, `schedule disable <name>`, or a file edit. **Rename is forbidden** via the edit path because `name` is the reuse-tab key; to rename, remove + add.
+**What the dialog deliberately does not do.** There is **no in-place field editing** and **no inline enable/disable toggle** — that keeps the terminal dialog simple. **Rename is forbidden** on the edit path because `name` is the reuse-tab key; to rename, delete and add.
 
-## Reference: the global config file
+That leaves one gap worth naming: **pausing a schedule has no button.** Ask the authoring agent to do it, or run [`schedule disable`](#the-schedule-cli) yourself. The five things you are most likely to want — creating, editing, deleting, firing now, and seeing what is scheduled — are all keys in this dialog.
 
-You rarely need to touch this directly — the doors above write it for you — but here is the on-disk format and every field, for hand-editing and debugging.
+### What the authoring agent does
 
-Schedule **definitions** live in a single global, per-user file:
+Both doors below open the same guided session:
 
-```
-~/.config/dot-agent-deck/schedules.toml
-```
+- **From the Scheduled Tasks dialog** — press **`s`** on the dashboard, then **`a`** / **`[Add]`** to author a new one (or **`e`** / **`[Edit]`** to start from an existing row's values). First a **directory picker** (the dir you choose becomes the authoring session's working directory, and is pre-seeded as the schedule's own working directory), then a small **New Schedule** / **Edit Schedule** form with a **Dir** and a free-text **Command** field (pre-filled from your `default_command`). Confirm to start the authoring session in that directory running that command; **`Esc`** / **`[Cancel]`** returns you to the dialog.
+- **From the new-deck / new-pane dialog** — open it (`Ctrl+n`), confirm a directory, and cycle the **Mode** field to the end — past your project's workload modes — to the built-in **`schedule`** option (marked as an *authoring session*).
 
-(honoring `$XDG_CONFIG_HOME` when set; override the path with the `DOT_AGENT_DECK_SCHEDULES` environment variable). It is **global** — not the per-project `.dot-agent-deck.toml` — because the daemon is global; which schedules are active must not depend on which directory you last launched the deck from.
+Either way a throwaway authoring session opens — running your chosen agent command, which defaults to your configured [`default_command`](configuration.md#default-command) and falls back to `claude` when that is unset — and walks you through it. It:
 
-Each task is a `[[scheduled_tasks]]` block:
+- asks you for the fields (name, cron, working dir, command, prompt, …);
+- asks for the **command that launches your agent** — it must result in a `claude`, `opencode`, `pi`, `codex`, or `devin` process, either directly (`claude`, `claude --model opus`, `opencode --model gpt-4o`, `pi`, `codex`, `devin`) or via a project wrapper that ends up launching one (`devbox run agent-new`, `npm run agent`). Those are the CLIs the deck integrates with for **live status tracking**; a command that doesn't result in one still runs but gets no status tracking, so the agent won't suggest unrelated CLIs (e.g. `gemini`). The command is **required** (there is no `$SHELL` fallback);
+- lets you **test the prompt in the same session** ("run it now, show me") before committing;
+- **confirms the full entry** with you, then calls `schedule add` (or `schedule update` on the edit path).
 
-```toml
-[[scheduled_tasks]]
-name = "morning-digest"
-cron = "0 9 * * MON-FRI"
-working_dir = "~/scheduled/morning-digest"
-command = "claude"
-prompt = """
-Generate a brief: Barcelona weather forecast for today, plus the list of
-GitHub issues opened in the last 24h across vfarcic/dot-ai and
-vfarcic/dot-agent-deck. Notify when done.
-"""
-# shape = "single"        # optional: force ONE agent even where this dir
-                          # defines [[orchestrations]]. Omit to derive the
-                          # shape from that dir's config (the default).
-new_tab_per_fire = false
-enabled = true
-```
+The agent writes the entry for you, so you don't have to get the cron syntax or prompt formatting right by hand. When it's done it tells you that **this authoring pane existed only to create the schedule and can be closed** — when the schedule later fires, a single-agent run **appears live in its own pane** on the deck, while an orchestration-targeted run opens in its tab when the deck is (re)opened.
 
-### Field reference
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `name` | string | yes | Unique id. Also the key that ties a task to its reused tab — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
-| `cron` | string | yes | A **5-field POSIX** cron expression (`min hour day-of-month month day-of-week`), e.g. `0 9 * * MON-FRI`. Evaluated in **local time**. 6/7-field forms (with a seconds field) are also accepted. |
-| `working_dir` | string | yes | Directory the fire spawns into. `~` and `$VAR` / `${VAR}` are expanded at load time; a relative path resolves against `$HOME` (never the authoring agent's cwd). Created with `mkdir -p` if missing. |
-| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, `pi`, `codex`, or `devin`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** whenever the fire resolves to an orchestration — which is the case when the target dir defines an `[[orchestrations]]` block and the task does not set `shape` (the orchestration's role commands win). Set `shape = "single"` to make `command` take effect in such a directory. |
-| `prompt` | string | yes | The prompt delivered into the spawned agent (or the orchestrator role). |
-| `shape` | string | no (default: derived) | Forces the fire's **spawn shape** instead of deriving it from `working_dir`'s config. `"single"` opens **one** agent card running `command`, *even where that directory defines `[[orchestrations]]`*; `"orchestration"` opens that directory's default orchestration; `"orchestration:<name>"` opens the one with that name. **Omit it** and the shape is derived exactly as before. Any other value is a **load error** naming the task (not a surprise on the next fire). Cannot be combined with `issue_dispatch` — that task type resolves a shape per cloned repo — and the combination is rejected rather than ignored. |
-| `new_tab_per_fire` | bool | no (default `false`) | `false` reuses one tab per task; `true` opens a fresh tab every fire. See [Tab reuse](#tab-reuse). |
-| `enabled` | bool | no (default `true`) | `false` keeps the definition but stops it firing. |
-
-> **Local time & daylight saving**
->
-> Cron is evaluated in the host's **local time** — there is no timezone field. At a daylight-saving transition this means a fire may be **skipped** (the spring-forward hour never occurs) or **run twice** (the fall-back hour repeats). This is an accepted tradeoff of local-time scheduling; if you need exactness across a DST boundary, avoid scheduling inside the transition hour.
-
-### What happens when a task fires
+## What happens when a task fires
 
 When a task fires, the scheduler decides its **shape**. If the task sets `shape`, that choice wins outright. Otherwise the shape is derived from the **target `working_dir`'s** `.dot-agent-deck.toml`:
 
@@ -355,3 +247,119 @@ breaking changes, and follow-up issues to open. Delegate the per-area review.
 """
 enabled = true
 ```
+
+## Reference
+
+You do not need this section to create or manage a schedule — the deck and its authoring agent cover that. It is here for four things: **reading back** what the agent wrote, **scripting** schedule changes, **pausing** a task (the one action with no button), and working on a machine where the TUI is not running.
+
+### The global config file
+
+You rarely need to touch this directly — the doors above write it for you — but here is the on-disk format and every field, for hand-editing and debugging.
+
+Schedule **definitions** live in a single global, per-user file:
+
+```
+~/.config/dot-agent-deck/schedules.toml
+```
+
+(honoring `$XDG_CONFIG_HOME` when set; override the path with the `DOT_AGENT_DECK_SCHEDULES` environment variable). It is **global** — not the per-project `.dot-agent-deck.toml` — because the daemon is global; which schedules are active must not depend on which directory you last launched the deck from.
+
+Each task is a `[[scheduled_tasks]]` block:
+
+```toml
+[[scheduled_tasks]]
+name = "morning-digest"
+cron = "0 9 * * MON-FRI"
+working_dir = "~/scheduled/morning-digest"
+command = "claude"
+prompt = """
+Generate a brief: Barcelona weather forecast for today, plus the list of
+GitHub issues opened in the last 24h across vfarcic/dot-ai and
+vfarcic/dot-agent-deck. Notify when done.
+"""
+# shape = "single"        # optional: force ONE agent even where this dir
+                          # defines [[orchestrations]]. Omit to derive the
+                          # shape from that dir's config (the default).
+new_tab_per_fire = false
+enabled = true
+```
+
+### Field reference
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | yes | Unique id. Also the key that ties a task to its reused tab — see [Tab reuse](#tab-reuse). Renaming is forbidden (it would orphan an open reused tab); treat a rename as remove + add. |
+| `cron` | string | yes | A **5-field POSIX** cron expression (`min hour day-of-month month day-of-week`), e.g. `0 9 * * MON-FRI`. Evaluated in **local time**. 6/7-field forms (with a seconds field) are also accepted. |
+| `working_dir` | string | yes | Directory the fire spawns into. `~` and `$VAR` / `${VAR}` are expanded at load time; a relative path resolves against `$HOME` (never the authoring agent's cwd). Created with `mkdir -p` if missing. |
+| `command` | string | **yes** | The agent command for the **single-agent** card (e.g. `claude`, `opencode`, `pi`, `codex`, or `devin`), mirroring the new-deck dialog's command field. **Required**: `schedule add` errors without it and the loader **rejects (skips) a command-less entry** — there is **no `$SHELL` fallback**. Required **universally**, including orchestration-target schedules: it is still validated at load, but **ignored at fire** whenever the fire resolves to an orchestration — which is the case when the target dir defines an `[[orchestrations]]` block and the task does not set `shape` (the orchestration's role commands win). Set `shape = "single"` to make `command` take effect in such a directory. |
+| `prompt` | string | yes | The prompt delivered into the spawned agent (or the orchestrator role). |
+| `shape` | string | no (default: derived) | Forces the fire's **spawn shape** instead of deriving it from `working_dir`'s config. `"single"` opens **one** agent card running `command`, *even where that directory defines `[[orchestrations]]`*; `"orchestration"` opens that directory's default orchestration; `"orchestration:<name>"` opens the one with that name. **Omit it** and the shape is derived exactly as before. Any other value is a **load error** naming the task (not a surprise on the next fire). Cannot be combined with `issue_dispatch` — that task type resolves a shape per cloned repo — and the combination is rejected rather than ignored. |
+| `new_tab_per_fire` | bool | no (default `false`) | `false` reuses one tab per task; `true` opens a fresh tab every fire. See [Tab reuse](#tab-reuse). |
+| `enabled` | bool | no (default `true`) | `false` keeps the definition but stops it firing. |
+
+> **Local time & daylight saving**
+>
+> Cron is evaluated in the host's **local time** — there is no timezone field. At a daylight-saving transition this means a fire may be **skipped** (the spring-forward hour never occurs) or **run twice** (the fall-back hour repeats). This is an accepted tradeoff of local-time scheduling; if you need exactness across a DST boundary, avoid scheduling inside the transition hour.
+
+### The `schedule` CLI
+
+This is the interface the authoring agent uses on your behalf — it never edits the TOML directly — so every guarantee below (cron validation, path expansion, atomic write, daemon reload) applies whether the agent runs the command or you do.
+
+Run it yourself when you want to script a change, inspect or fire a task from a terminal, or **pause one** — `enable` / `disable` is the single operation the dialog does not offer.
+
+```bash
+# Add a task (validated, then saved to the global file). --command is REQUIRED:
+dot-agent-deck schedule add \
+  --name morning-digest \
+  --cron "0 9 * * MON-FRI" \
+  --working-dir ~/scheduled/morning-digest \
+  --command claude \
+  --prompt "Generate the morning brief. Notify when done." \
+  --enabled true
+
+# Force ONE agent even though the working dir defines [[orchestrations]]:
+dot-agent-deck schedule add \
+  --name pr-sweep \
+  --cron "0 9 * * *" \
+  --working-dir ~/code/dot-agent-deck \
+  --command claude \
+  --prompt "Triage the open PRs." \
+  --shape single
+
+# Update fields of an existing task (no --new-name; rename is forbidden):
+dot-agent-deck schedule update --name morning-digest --cron "0 8 * * MON-FRI"
+
+# Change the shape of an existing task, or clear it back to config-derived:
+dot-agent-deck schedule update --name pr-sweep --shape orchestration:review
+dot-agent-deck schedule update --name pr-sweep --shape ""
+
+# Pause / resume without deleting:
+dot-agent-deck schedule disable --name morning-digest
+dot-agent-deck schedule enable  --name morning-digest
+
+# Inspect:
+dot-agent-deck schedule list
+
+# Fire now, or ask a running daemon to re-read the file:
+dot-agent-deck schedule run-now --name morning-digest
+dot-agent-deck schedule reload
+
+# Remove the definition (does NOT close an open tab for the task):
+dot-agent-deck schedule remove --name morning-digest
+```
+
+| Subcommand | Purpose |
+|---|---|
+| `add` | Append a new task. **`--command` is required** (no `$SHELL` fallback). |
+| `update` | Change fields of an existing task by `name`. No rename. |
+| `remove` | Delete a task **definition** (leaves any open tab alive). |
+| `list` | Show each task with its enabled/disabled state and next-fire time. |
+| `enable` / `disable` | Flip `enabled` without deleting the definition. |
+| `run-now` | Fire the task immediately via the running daemon. |
+| `reload` | Tell the running daemon to re-read `schedules.toml`. |
+
+After any command that changes a task, the CLI tells a running daemon to reload, so it picks the change up immediately. If no daemon is running that's fine — the change loads on the next `daemon serve`.
+
+### Hand-editing the file
+
+The TOML is human-readable; edit `~/.config/dot-agent-deck/schedules.toml` directly (see the [reference](#the-global-config-file) below for the format), then run `dot-agent-deck schedule reload` (or just let the next daemon start pick it up).
