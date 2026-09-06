@@ -5596,13 +5596,23 @@ impl AgentPtyRegistry {
 
     /// PRD #20 R20-003 (finding #4): whether a deck client is CURRENTLY attached
     /// to (driving) `pane_id` — i.e. its agent's PTY stream has ≥1 live
-    /// subscriber. The write-and-submit session guard uses this to scope its
-    /// strictest check: a stale prompt that would surface in a LIVE INTERACTIVE
-    /// conversation (an attached pane the user is watching — finding #4's actual
-    /// threat) is refused even when the pane reports NO current hook session,
-    /// whereas a headless, unattached delivery with a confirmed agent identity
-    /// proceeds. In the real deck the TUI is always attached to a pane it drives,
-    /// so the strict guard applies to every real automatic-prompt delivery.
+    /// subscriber.
+    ///
+    /// **Issue #915 (finding 5): no authorization decision reads this any more,
+    /// and none should.** It used to scope the write-and-submit session guard's
+    /// strictest check — a named-generation delivery into a pane reporting NO
+    /// current hook session was refused on an attached pane and allowed on a
+    /// headless one. The value cannot be sampled inside the writer-held
+    /// re-validation barrier, because `subscribe` never acquires the target
+    /// writer, so it was read from the registry before the `AppState` guard and
+    /// could be stale in the PERMISSIVE direction. That refusal is now
+    /// unconditional (`daemon_protocol`'s axis-2 closure), which is why the last
+    /// production consumer went with it.
+    ///
+    /// Kept as a diagnostic/test observable — its remaining callers are the
+    /// `daemon_protocol` tests that pin the new rule holds either way. A new
+    /// authorization call site would be re-opening the stale-read race, not
+    /// reusing a helper.
     pub fn pane_has_live_attach(&self, pane_id: &str) -> bool {
         let inner = self.inner.lock().unwrap();
         inner.agents.values().any(|a| {

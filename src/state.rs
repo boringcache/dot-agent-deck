@@ -1178,6 +1178,47 @@ pub struct AppState {
     /// Monotonic per pane, `u64`, in memory only; it grows by one per real
     /// conversation rollover, which no daemon lifetime can exhaust.
     pane_generation_closures: HashMap<String, u64>,
+    /// Issue #915 (finding 4): how many of each AGENT's own hook generations
+    /// have ended, keyed by the registry agent id the `SessionEnd` carried.
+    ///
+    /// The daemon's write guard has a deliberate carve-out for the
+    /// `(caller named no generation, pane has no current generation)` pair,
+    /// because an agent that never emits a generation legitimately carries
+    /// neither side of the comparison. A `None` current generation is not proof
+    /// that that is what it is looking at: [`Self::pane_hook_session`] is
+    /// REMOVED when a matching, non-superseded `SessionEnd` lands, while the
+    /// registry agent and its pane stay alive — so a conversation that has just
+    /// ended reads there exactly like an agent that never had one. During a
+    /// `/clear` or a thread restart the successor's `SessionStart` has not
+    /// landed yet, and a caller that knows the stable agent id but names no
+    /// generation could land a write in that gap. This is the evidence that
+    /// tells the two apart.
+    ///
+    /// **Keyed by AGENT, never by pane, and that is the whole design.**
+    /// [`Self::pane_generation_closures`] records the same transition but keyed
+    /// by pane, and nothing ever removes an entry when a pane closes or is
+    /// recycled (its only `.remove()` calls are the snapshot-and-restore inside
+    /// [`Self::apply_daemon_report_event`], which is not a cleanup path). A
+    /// pane-keyed witness would therefore refuse EVERY future sessionless agent
+    /// that ever inherits that pane id, for the daemon's remaining lifetime —
+    /// permanently, not in a race window — which is exactly the "refuses the
+    /// sessionless agents the carve-out exists to protect" failure this had to
+    /// avoid. Registry agent ids are monotonic and never recycled within a
+    /// daemon process ([`crate::agent_pty::AgentPtyRegistry::spawn_agent`]), and
+    /// `AppState` is in-memory and dies with that process, so the map and the id
+    /// space reset together.
+    ///
+    /// FAILS OPEN when the evidence is absent: `AgentEvent::agent_id` is an
+    /// `Option` and events from external agents (or any producer that lost
+    /// `DOT_AGENT_DECK_AGENT_ID` on the way) carry `None`, so no witness is
+    /// recorded and the carve-out accepts the write exactly as it did before.
+    /// That is a degradation to the previous behaviour rather than a new hole,
+    /// and it is the right default — the alternative refuses the very agents the
+    /// carve-out exists for — but it is a documented limit, not a guarantee.
+    ///
+    /// Monotonic per agent, `u64`, in memory only; it grows by one per real
+    /// conversation end, bounded by the agents this daemon ever spawned.
+    agent_generation_closures: HashMap<String, u64>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -5669,6 +5710,38 @@ impl AppState {
             .unwrap_or(0)
     }
 
+    /// Issue #915 (finding 4): record that `agent_id`'s own established
+    /// generation just ended. See [`Self::agent_generation_closures`].
+    fn note_agent_generation_closed(&mut self, agent_id: &str) {
+        let entry = self
+            .agent_generation_closures
+            .entry(agent_id.to_string())
+            .or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// Issue #915 (finding 4): how many conversations of `agent_id`'s own have
+    /// ended over this daemon's lifetime. See
+    /// [`Self::agent_generation_closures`].
+    pub fn agent_generation_closures(&self, agent_id: &str) -> u64 {
+        self.agent_generation_closures
+            .get(agent_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Issue #915 (finding 4): has `agent_id` ever had a hook generation END?
+    ///
+    /// The daemon's write guard reads this to tell a genuinely sessionless agent
+    /// (never any generation → accept, the carve-out) from one whose
+    /// conversation has just closed and whose successor generation has not
+    /// announced itself yet (→ refuse). `false` for an agent this daemon has
+    /// seen no `SessionEnd` for, which includes every producer that named no
+    /// agent id — see the type's docs for that fail-open limit.
+    pub fn agent_generation_ended(&self, agent_id: &str) -> bool {
+        self.agent_generation_closures.contains_key(agent_id)
+    }
+
     /// PRD #20 Greptile finding #3: the write-semantics of the newest live
     /// session produced by `agent_id`, resolved by agent identity rather than by
     /// pane. A daemon-side agent with no `pane_id_env` maps to the `<no-pane>`
@@ -7354,6 +7427,19 @@ impl AppState {
                 // snapshot afterwards that there WAS one. See
                 // [`Self::pane_generation_closures`].
                 self.note_generation_closed(pane_id);
+                // Issue #915 (finding 4): the same transition, recorded against
+                // the AGENT that ended rather than against the pane it was
+                // sitting on. The daemon's write guard needs this to tell a
+                // just-ended conversation from an agent that never had one —
+                // both of which leave `pane_hook_session` empty from here on.
+                // Keyed by agent because the pane-keyed counter above is never
+                // cleaned up on pane recycle, so reading THAT one here would
+                // refuse a genuinely sessionless successor forever. See
+                // [`Self::agent_generation_closures`]; a producer that named no
+                // agent id records nothing and the guard keeps its carve-out.
+                if let Some(agent_id) = event.agent_id.as_deref() {
+                    self.note_agent_generation_closed(agent_id);
+                }
             }
             // Preserve started_at for the pane so a restarted session keeps its position.
             //
@@ -7821,6 +7907,103 @@ impl AppState {
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #915 (finding 4): the ended-generation witness the daemon's write
+    /// guard reads is recorded against the AGENT that ended, is not inherited by
+    /// a successor on the same pane, and is simply absent for a producer that
+    /// named no agent id.
+    ///
+    /// All three properties are the design, not incidental. Keying by pane would
+    /// have refused every future sessionless agent on that pane id for the
+    /// daemon's lifetime, because the pane-keyed counter next door is never
+    /// cleaned up on recycle; and the absent-evidence case has to keep reading
+    /// as "no witness" so the guard's carve-out for genuinely sessionless agents
+    /// survives.
+    #[test]
+    fn an_ended_generation_is_witnessed_against_its_agent_not_its_pane() {
+        fn end(session: &str, pane: &str, agent: Option<&str>, secs: i64) -> AgentEvent {
+            AgentEvent {
+                session_id: session.to_string(),
+                agent_type: AgentType::ClaudeCode,
+                event_type: EventType::SessionEnd,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(secs),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(pane.to_string()),
+                agent_id: agent.map(|a| a.to_string()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+            }
+        }
+        fn start(session: &str, pane: &str, agent: &str, secs: i64) -> AgentEvent {
+            let mut ev = end(session, pane, Some(agent), secs);
+            ev.event_type = EventType::SessionStart;
+            ev
+        }
+
+        let mut state = AppState::default();
+        state.register_pane("pane".to_string());
+
+        // Nothing has ended yet: the guard's carve-out applies to every agent.
+        assert!(!state.agent_generation_ended("agent-1"));
+        assert_eq!(state.agent_generation_closures("agent-1"), 0);
+
+        // A conversation runs and ends on `agent-1`. The pane's generation is
+        // gone — which is exactly what makes the pane unable to tell this apart
+        // from an agent that never had one — but the witness remembers.
+        state.apply_event(start("gen-a", "pane", "agent-1", 1));
+        assert_eq!(state.pane_hook_session_id("pane").as_deref(), Some("gen-a"));
+        state.apply_event(end("gen-a", "pane", Some("agent-1"), 2));
+        assert!(
+            state.pane_hook_session_id("pane").is_none(),
+            "the ended generation must leave `pane_hook_session` empty — the ambiguity this \
+             witness exists to resolve"
+        );
+        assert!(state.agent_generation_ended("agent-1"));
+        assert_eq!(state.agent_generation_closures("agent-1"), 1);
+
+        // The pane changes hands. `agent-2` has never had a generation, so it
+        // must NOT inherit its predecessor's witness — a pane-keyed witness
+        // would refuse it here, and every later occupant of this pane id too.
+        assert!(
+            !state.agent_generation_ended("agent-2"),
+            "a successor on the same pane id must not inherit the departed agent's witness"
+        );
+        assert_eq!(state.agent_generation_closures("agent-2"), 0);
+
+        // A second rollover on `agent-1` (a `/clear`) counts again, and does not
+        // touch the successor.
+        state.apply_event(start("gen-b", "pane", "agent-1", 3));
+        state.apply_event(end("gen-b", "pane", Some("agent-1"), 4));
+        assert_eq!(state.agent_generation_closures("agent-1"), 2);
+        assert!(!state.agent_generation_ended("agent-2"));
+
+        // A producer that named NO agent id records nothing. The guard then
+        // behaves exactly as it did before this change for that producer — the
+        // fail-open limit, pinned so it is a decision rather than a surprise.
+        state.register_pane("external".to_string());
+        state.apply_event(start("gen-x", "external", "agent-3", 5));
+        let mut anonymous = end("gen-x", "external", None, 6);
+        anonymous.agent_id = None;
+        state.apply_event(anonymous);
+        assert!(
+            state.pane_hook_session_id("external").is_none(),
+            "the anonymous end must still clear the pane's generation"
+        );
+        assert!(
+            !state.agent_generation_ended("agent-3"),
+            "an event that names no agent id witnesses nothing — fail-open by design"
+        );
+        assert_eq!(
+            state.pane_generation_closures("external"),
+            1,
+            "the pane-keyed counter still counts it; only the agent-keyed witness needs an id"
+        );
+    }
 
     /// Issue #424 D2: `AppState`'s pane generation must not be pinnable by a
     /// producer-chosen timestamp either.
