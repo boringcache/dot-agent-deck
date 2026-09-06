@@ -52,6 +52,7 @@ The single most useful number the #749 run produced: **41% of its local gate wal
 
 When the invocation names a level (N=1, N=3, N=5):
 
+- **Dispatching N units together does not make them work together.** Agents drift out of phase within minutes, and the expensive gates are a small fraction of wall time, so a level labelled N=2 can contain almost no real contention. Condition the analysis on *measured* overlap — intersect the UTC gate windows — and report the overlap fraction as a first-class number. Gates that did not overlap are two more N=1 samples and must not be averaged in as if they were contended. If overlap turns out to be rare, that is itself the finding. [`scripts/sample-attribution.sh`](../../scripts/sample-attribution.sh) measures it from the box side, independently of what agents self-report.
 - **Report only your own processes.** Do not attempt machine-wide claims — with several agents running you cannot see the box, and an inference will be wrong. Whole-box state (PSI, `MemAvailable`, load, disk, total RSS, pool occupancy) is captured separately by [`scripts/sample-box.sh`](../../scripts/sample-box.sh), run by the coordinator, and correlated with your gates by timestamp. This is why UTC timestamps are mandatory.
 - **`time -v`'s max RSS is the largest single process, not a sum.** At N>1 total memory is the binding constraint and only the box sampler can see it. Do not present your peak as the machine's.
 - **Record your own start time** so "N=3" means three agents actually overlapping, rather than one finishing before another began.
