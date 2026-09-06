@@ -1117,6 +1117,16 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the fix's internal clock-comparison location or the detached spawn watcher (covered by `scheduler/dispatch/018`).
 - **Platform coverage:** mac+linux.
 
+
+##### prompt/pane-input/033 — An armed native-seed PTY-injection fallback is refused, with no bytes written and the seed dropped, when the pane changed hands inside the grace (issue #617, finding 6).
+- **Layer:** fast integration, in `src/agent_pty.rs`'s own `mod tests` (the real `arm_seed_fallback` against registry-owned PTYs; no daemon, no pi, no extension, no LLM and no `e2e` feature gate).
+- **Agent:** none — two `/bin/cat` byte targets, the second inheriting the first's `DOT_AGENT_DECK_PANE_ID`. The grace is passed as a PARAMETER (200 ms), so the 15 s default and its second-granularity `DOT_AGENT_DECK_SEED_FALLBACK_SECS` env var are both out of the picture.
+- **Asserts:** three things. `arm_seed_fallback` is a fire-and-forget `tokio::spawn` that returns nothing, so the refusal is read from the only place the code publishes it: a thread-scoped `tracing` subscriber must capture `seed fallback: identity gate refused the PTY injection` naming `WrongSession`. Then the seed must be DROPPED rather than restored — `take_pending_seed_fallback` returns `None` afterwards, which also proves the armed task actually fired. Then the seed's bytes must be absent from the successor's scrollback, barriered by an `Applied` authorized write asserted visible first.
+- **The seed the fallback finds at fire time is the SUCCESSOR'S OWN, and that is a property of the fixture worth knowing.** The store is keyed by pane and the original's record goes with it on close, so the only stashable seed is the one the new occupant stashes at its own spawn — which is what production does. That is also what makes the pre-fix behaviour harmful rather than merely wrong: a task nobody authorized consumes the new occupant's seed and presses Enter on it, before that occupant's own native `get-seed` pull could take it. The successor's own fallback is deliberately NOT armed, so the only thing that could type the seed into its PTY is the original's armed task.
+- **Why it exists:** nothing in either tier called `arm_seed_fallback` at all before this — the three tests that name the grace (`e2e_pi_live.rs`, `e2e_pi_worker.rs`, `e2e_delegate_work_done_chain.rs`) are all lane 2 and all set `DOT_AGENT_DECK_SEED_FALLBACK_SECS=600` precisely so the fallback does NOT fire. The registry's `take`/`set` arbitration was unit-tested; the write was not.
+- **Does not assert:** the NATIVE `get-seed` pull that normally wins the race (`take_pending_seed_native` and its flag are unit-tested beside it); the two production callers that arm it; the `Ambiguous` partial-write branch.
+- **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
+
 #### prompt/quit
 
 ##### prompt/quit/001 — `Ctrl+c` from command mode opens the quit confirmation dialog with three options: **Detach** (default), **Stop**, **Cancel**.
@@ -2666,6 +2676,15 @@ without depending on the config struct API.
 - **Does not assert:** the guarded-send refusal arm's release (unit-tested arithmetic plus a manual real-binary run; forcing an undelivered guarded send here would depend on the spawned dispatch task winning a race); the pi-native seed return, which is a DELIVERY path and correctly keeps its commission; the readiness-buffer close return, where `begin_pane_close`'s sweep is the discharge.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
+
+##### orchestration/work-done/006 — A worker's completion feedback is refused, with no bytes written, when the orchestrator pane changed hands between the delegate and the completion (issue #617, finding 7).
+- **Layer:** fast integration (the real `handle_delegate` / `handle_work_done` against daemon-owned PTYs, with the role maps populated exactly as `StartAgent` populates them; no LLM and no `e2e` feature gate).
+- **Agent:** none — the harness's raw no-echo `cat` orchestrator, plus a second one that replaces it on the same pane carrying the SAME `TabMembership`, role and orchestration. Only the registry agent id differs, which is exactly the input under test.
+- **Asserts:** both halves, with a control first. A plain delegate → `work-done` pair must deliver the ordinary completion pointer into the orchestrator pane, so a later absence cannot be blamed on a fixture that never delivered anything. Then a second delegate is issued while the ORIGINAL orchestrator owns the pane, the orchestrator is restarted in place, and the worker reports: the successor's scrollback must hold its own readiness marker and a later `Applied` barrier write, and none of the pointer, the unsolicited label or the untrusted-report frame. `close_agent` is the deliberate hand-over spelling — it removes the record before the child dies, so the pane-EOF delegation sweep does not run and the outstanding delegation survives the restart, leaving the identity gate as the only thing between the completion and the new occupant.
+- **Why it exists:** the feedback write was keyed by pane id and nothing else, so an orchestrator respawned or rebound between `orchestrator_for_worker`'s lookup and the write had a previous conversation's completion report typed into it and submitted — and a pane id is a recycled handle, so the new occupant need not be part of the orchestration at all.
+- **Does not assert:** the UNSOLICITED fallback's weaker binding (a completion nobody commissioned has no commissioning identity and falls back to the pane's current live agent, resolved immediately before the call — documented as weaker in the code); the `Ambiguous` partial-write branch; what the TUI paints for either orchestrator card.
+- **Platform coverage:** mac+linux (unix-only — the observer stubs are POSIX shell).
+
 #### orchestration/identity
 
 ##### orchestration/identity/001 — Opening an orchestration whose form/display name (worktree dir basename) differs from the TOML config orchestration name stamps the CANONICAL config name as the daemon IDENTITY, not the basename (PRD #107 regression).
@@ -3055,6 +3074,15 @@ without depending on the config struct API.
 - **Why it exists:** the listing and the spawn are two independent readings of the same config, and #704 is precisely the case where they disagreed. Asserting them in one test is what makes "the marker is honest" a claim rather than a hope. The `2 roles` assertion is deliberately the inheritance check: a count computed from the block as written is 1, so it cannot pass without the resolution having happened in the daemon rather than in a unit test.
 - **Does not assert:** the ambiguity diagnostic for an UNDECLARED default (the `default_orchestration` / `list_targets_response` unit tests own the wording); the scheduler path's half of the same rule (`scheduler/spawn/008`); delegation, role cards or the orchestrator context (`orchestration/dispatch/001`).
 - **Platform coverage:** mac+linux.
+
+
+##### orchestration/dispatch/005 — A dispatch result is refused, with no bytes written, when the caller's pane changed hands while the dispatch ran (issue #617, finding 3).
+- **Layer:** fast integration (the real `daemon::deliver_dispatch_result` seam against daemon-owned PTYs; no daemon process, no `handle_dispatch`, no git, no LLM and no `e2e` feature gate).
+- **Agent:** none — two raw, no-echo `cat` stubs (`stty -echo -icanon -icrnl -opost` then `printf <marker>` then `exec cat -u`), so every byte the daemon submits appears exactly once and nothing else does. The first is the agent that asked for the dispatch; the second merely inherits its `DOT_AGENT_DECK_PANE_ID` after it is closed.
+- **Asserts:** both halves. `deliver_dispatch_result`, bound to the caller's registry agent id, returns `GuardedSend::WrongSession`; and the result text never appears in the successor's scrollback. The absence is barriered rather than slept on — an AUTHORIZED write to the successor is asserted `Applied` and then asserted VISIBLE in its snapshot, so the pane has demonstrably drained past the point where a leaked result would have landed. Both stubs' readiness markers are asserted before the hand-over and before the absence, so neither side can pass because a stub never started.
+- **Why it exists:** between the dispatch request and this delivery sits `handle_dispatch` — a worktree creation plus an agent spawn, unbounded and deliberately outside any `AppState` lock — and a pane id is a recycled handle. Pre-fix the delivery was `write_to_pane_and_submit(&signal.pane_id, …)`, so a caller closed or respawned during that work had its dispatch result typed into, and submitted in, whatever process inherited its pane — which may then act on it with its own tools. The delivery was extracted into a named seam by the same commit precisely so this could be a fast-tier test instead of an end-to-end one.
+- **Does not assert:** `handle_dispatch` itself (unit-tested in `src/dispatch.rs`), the hook-loop plumbing that calls this seam (`orchestration/dispatch/001`, `scheduler/dispatch/001-009`), or the `Ambiguous` partial-write branch, which needs a writer that fails mid-payload rather than a hand-over.
+- **Platform coverage:** mac+linux (unix-only — the observer stubs are POSIX shell).
 
 #### dispatch/close
 
@@ -4488,6 +4516,15 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Asserts:** after a simulated keystroke, a reuse fire's prompt is NOT delivered within the debounce window and IS delivered into the same pane once the window elapses; a later fire with no recent input is delivered immediately.
 - **Does not assert:** the production default debounce duration (the test injects a short one); queue depth beyond the latest prompt.
 - **Platform coverage:** mac+linux.
+
+
+##### scheduler/reuse/004 — A reuse fire's queued prompt is refused, with no bytes written, when the delivery pane changes hands inside the deliver-on-idle debounce (issue #617, finding 2).
+- **Layer:** fast integration, in `src/spawn.rs`'s own `mod tests` because `deliver_on_idle` is private (real `deliver_on_idle` against registry-owned PTYs; no daemon, no scheduler, no `e2e` feature gate).
+- **Agent:** none — two `/bin/cat` byte targets, the second inheriting the first's `DOT_AGENT_DECK_PANE_ID`. The debounce is passed as a PARAMETER (600 ms), so neither `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` nor the 60 s `REUSE_DELIVERY_HARD_TIMEOUT` is in play: the race lives inside the debounce, not at the starvation cap.
+- **Asserts:** both halves. A simulated keystroke (`note_user_input`) parks the delivery for the whole debounce — without it the write happens before anything can change hands and the test measures nothing — and the hand-over lands a quarter of the way in. `deliver_on_idle` returns `()`, so the refusal is read from the only place the code publishes it: a `tracing` subscriber scoped to the test's thread must capture the `scheduled reuse prompt refused` warning naming `WrongSession`. Then the prompt must be absent from the successor's scrollback, barriered by an `Applied` authorized write that is asserted visible first.
+- **Why it exists:** this wait is the race. It runs for at least the debounce (5 s by default) and up to 60 s under continuous typing, and it used to retain nothing but a pane id and finish through the ungated `write_to_pane_and_submit` — so an agent that exited during the window had a scheduled prompt submitted into whoever inherited its pane. `scheduler/reuse/003` covers the debounce's timing on the real binary but cannot see a `GuardedSend`, and it is L2; a security regression guard belongs where CI runs it.
+- **Does not assert:** the reuse DECISION that resolves the identity (`decide_reuse_spawns_fresh_when_the_pane_id_was_inherited_by_another_agent`, a pure unit test beside it, and `scheduler/reuse/001` / `/002` for the tab-count surface); the hard-timeout policy (`decide_delivery_capped` is pure and unit-tested); the issue #424 F1 record lifecycle this delivery now participates in.
+- **Platform coverage:** mac+linux (the `/bin/cat` byte target is POSIX).
 
 #### scheduler/manager
 

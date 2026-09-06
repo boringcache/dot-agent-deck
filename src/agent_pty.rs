@@ -8367,6 +8367,7 @@ mod tests {
 mod spawn_tests {
     use super::*;
     use crate::event::OrchestrationSurfaceRole;
+    use spec::spec;
     use std::time::Duration;
 
     // ---------------------------------------------------------------------
@@ -12283,5 +12284,171 @@ mod spawn_tests {
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "every agent must still be reaped, not merely signalled"
         );
+    }
+
+    /// Issue #617 (finding 6). A `tracing` subscriber scoped to this test's
+    /// thread, so the refusal [`arm_seed_fallback`] reports can be asserted as a
+    /// fact rather than inferred: the fallback is a fire-and-forget
+    /// `tokio::spawn` that returns nothing, and "no bytes in the successor"
+    /// alone cannot tell a REFUSED injection apart from one that never reached
+    /// the write.
+    ///
+    /// Deliberately a third copy rather than a shared helper. `mod tests` is
+    /// private to its file, so sharing this with the two that already exist
+    /// (`spawn::tests` and `state::tests`, each for the same reason) means
+    /// making one of them `pub(crate)` and widening a test-only surface across
+    /// the lib to save twenty lines of `MakeWriter` boilerplate.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Scenario: A pane has a native seed stashed and its PTY-injection safety
+    /// net armed for the agent the seed was stashed for; inside the grace the
+    /// pane changes hands — that agent goes away and a new one inherits the same
+    /// `DOT_AGENT_DECK_PANE_ID` and stashes a seed of its own. When the armed
+    /// fallback fires it must be refused as `WrongSession` with the seed dropped
+    /// rather than restored, and none of the seed's bytes may reach the
+    /// successor, whose scrollback still shows a later authorized write.
+    #[spec("prompt/pane-input/033")]
+    #[tokio::test]
+    async fn pane_input_033_seed_fallback_is_refused_when_the_pane_changed_hands() {
+        const PANE: &str = "seed-fallback-handover-pane";
+        const SEED: &str = "STASHED-SEED-MUST-NOT-BE-TYPED-BY-A-STRANGERS-TASK-8e42";
+        const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-1f56";
+        const GRACE: Duration = Duration::from_millis(200);
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let original = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent the seed is stashed for");
+        registry.set_pending_seed(PANE, SEED);
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // Armed for the agent that owns the pane RIGHT NOW, exactly as the two
+        // production callers arm it at spawn/respawn time. `grace` is a
+        // parameter, so the 15 s default and its second-granularity env var are
+        // both out of the picture.
+        arm_seed_fallback(registry.clone(), PANE.to_string(), original.clone(), GRACE);
+
+        // The hand-over, inside the grace. The seed store is keyed by PANE and
+        // the original's record goes with it, so the seed the fallback finds
+        // when it fires is the SUCCESSOR'S OWN — stashed by its own spawn, as
+        // production stashes one. That is what makes the pre-fix behaviour
+        // harmful rather than merely wrong: a task nobody authorized consumes
+        // the new occupant's seed and presses Enter on it, before the
+        // occupant's own native `get-seed` pull could take it. The successor's
+        // own fallback is deliberately NOT armed here, so the ONLY thing that
+        // could type this seed into its PTY is the original's armed task.
+        registry
+            .close_agent(&original)
+            .expect("close the agent the seed was stashed for");
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the agent that inherits the pane id");
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW registry agent id"
+        );
+        registry.set_pending_seed(PANE, SEED);
+
+        // Wait for the armed task to reach a terminal report rather than for a
+        // fixed multiple of the grace.
+        let log_text = || {
+            String::from_utf8(captured.0.lock().unwrap().clone())
+                .expect("captured log must be valid UTF-8")
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !log_text().contains("seed fallback:") && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(subscriber_guard);
+        let log = log_text();
+        assert!(
+            log.contains("seed fallback: identity gate refused the PTY injection"),
+            "the armed injection must reach its identity gate and be REFUSED there, not merely \
+             fail to write; captured log = {log:?}"
+        );
+        assert!(
+            log.contains("WrongSession"),
+            "the pane has a live agent that is not the one the seed was stashed for, so the \
+             refusal must be WrongSession — anything else means the fixture never got the \
+             hand-over it needed; captured log = {log:?}"
+        );
+        assert!(
+            registry.take_pending_seed_fallback(PANE).is_none(),
+            "the refused seed must be DROPPED, not restored: left in the store it stays pullable \
+             by the new occupant's own `get-seed`, re-opening the mis-delivery by the native \
+             route after the injection route refused it"
+        );
+
+        // A barrier, not a sleep: an AUTHORIZED write that has demonstrably
+        // arrived proves the successor's PTY has drained past the point where a
+        // leaked seed would have landed.
+        let barrier = registry
+            .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
+            .await
+            .expect("the barrier write must reach the registry");
+        assert_eq!(
+            barrier,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
+             this test proves nothing about the refusal above"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut snapshot = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            snapshot = registry.snapshot(&successor).unwrap_or_default();
+            if snapshot
+                .windows(BARRIER.len())
+                .any(|w| w == BARRIER.as_bytes())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let rendered = String::from_utf8_lossy(&snapshot).into_owned();
+        assert!(
+            rendered.contains(BARRIER),
+            "the barrier write never reached the successor's PTY, so the absence below is \
+             untested; snapshot = {rendered:?}"
+        );
+        assert!(
+            !rendered.contains(SEED),
+            "a stashed seed was typed into — and submitted in — an agent that merely inherited \
+             the pane id of the agent it was stashed for; snapshot = {rendered:?}"
+        );
+
+        registry.shutdown_all();
     }
 }

@@ -5900,4 +5900,121 @@ mod tests {
             }
         }
     }
+
+    /// Issue #617 (finding 2). A `tracing` subscriber scoped to this test's
+    /// thread, so the refusal `deliver_on_idle` reports can be asserted as a
+    /// fact rather than inferred. The function returns `()`, and "no bytes in
+    /// the successor" alone cannot tell a REFUSED delivery apart from one that
+    /// never reached the write at all — a debounce loop that spun forever, or a
+    /// target that resolved to nothing — so the outcome has to be read from the
+    /// only place the code publishes it. Same idiom, and the same reason, as
+    /// `state::tests::dispatch_one_owned_refuses_write_when_worker_identity_is_unresolved`.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Scenario: A scheduled task reuses its tab, and because the user has just
+    /// typed the queued prompt is parked for the whole deliver-on-idle debounce;
+    /// inside that window the agent the reuse decision resolved goes away and an
+    /// unrelated one inherits the same `DOT_AGENT_DECK_PANE_ID`. The delivery
+    /// must be refused as `WrongSession`, and none of the prompt's bytes may
+    /// reach the successor, whose scrollback still shows a later authorized
+    /// write.
+    #[spec("scheduler/reuse/004")]
+    #[tokio::test]
+    async fn reuse_004_a_hand_over_inside_the_debounce_refuses_the_queued_prompt() {
+        const PANE: &str = "reuse-handover-during-debounce";
+        const PROMPT: &str = "SCHEDULED-PROMPT-MUST-NOT-REACH-THE-SUCCESSOR-6a1e";
+        const BARRIER: &str = "AUTHORIZED-WRITE-AFTER-THE-REFUSAL-3c88";
+        const DEBOUNCE: Duration = Duration::from_millis(600);
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let original = spawn_byte_target(&registry, PANE);
+
+        // The user typed a moment ago, so `decide_delivery_capped` parks the
+        // delivery for the whole debounce rather than writing immediately. That
+        // wait IS the race window — it is what the fire holds a bare pane id
+        // across — so without this the write happens before anything can change
+        // hands and the test measures nothing.
+        registry.note_user_input(PANE);
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+            .with_ansi(false)
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        // Both halves run on this task, not on a spawned one, so the delivery's
+        // `warn!` lands in the thread-local subscriber above.
+        let (_, successor) = tokio::join!(
+            deliver_on_idle(&registry, PANE, &original, PROMPT, DEBOUNCE),
+            async {
+                tokio::time::sleep(DEBOUNCE / 4).await;
+                registry
+                    .close_agent(&original)
+                    .expect("close the agent the reuse decision resolved");
+                spawn_byte_target(&registry, PANE)
+            }
+        );
+        drop(subscriber_guard);
+        assert_ne!(
+            original, successor,
+            "the hand-over must produce a NEW registry agent id"
+        );
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("captured log must be valid UTF-8");
+        assert!(
+            log.contains("scheduled reuse prompt refused"),
+            "the delivery must reach its identity gate and be REFUSED there, not merely fail to \
+             write; captured log = {log:?}"
+        );
+        assert!(
+            log.contains("WrongSession"),
+            "the pane has a live agent that is not the expected one, so the refusal must be \
+             WrongSession — anything else means the fixture never got the hand-over it needed; \
+             captured log = {log:?}"
+        );
+
+        // A barrier, not a sleep: an AUTHORIZED write that has demonstrably
+        // arrived proves the successor's PTY has drained past the point where a
+        // leaked prompt would have landed.
+        let barrier = registry
+            .write_and_submit_guarded(PANE, BARRIER, &successor, || async { true })
+            .await
+            .expect("the barrier write must reach the registry");
+        assert_eq!(
+            barrier,
+            GuardedSend::Applied,
+            "the successor owns the pane, so a write bound to IT must be applied — otherwise \
+             this test proves nothing about the refusal above"
+        );
+        let snapshot = wait_for_detached_payload_echo(&registry, &successor, BARRIER).await;
+        assert!(
+            !String::from_utf8_lossy(&snapshot).contains(PROMPT),
+            "a scheduled task's prompt was submitted into a process that merely inherited the \
+             pane id of the agent the reuse decision resolved; snapshot = {:?}",
+            String::from_utf8_lossy(&snapshot)
+        );
+
+        registry.shutdown_all();
+    }
 }
