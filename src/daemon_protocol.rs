@@ -1426,6 +1426,21 @@ async fn compute_write_and_submit_outcome(
                         // to the previous behaviour, which is the right
                         // default, and both are documented limits rather than
                         // guarantees.
+                        //
+                        // THE WITNESS IS A LATCH, NOT A WINDOW. No path clears
+                        // it as cleanup, so "has ended a generation" is true of
+                        // that agent for the daemon's remaining lifetime. What
+                        // makes the refusal transient in practice is the check
+                        // ABOVE it, not this one: the moment a successor
+                        // generation announces itself the pane has a current
+                        // session again and the first branch refuses instead,
+                        // so the witness only ever decides the case where the
+                        // TARGET PANE has no current generation. The cost that
+                        // leaves is an agent whose successor `SessionStart`
+                        // this daemon never observes — live, in a real
+                        // conversation, and refused on every unnamed automatic
+                        // delivery until it ends. See
+                        // `crate::state::AppState::agent_generation_closures`.
                         match expected_session.as_deref() {
                             Some(expected) => match guard.pane_hook_session_id(&pane_for_check) {
                                 Some(current) if current != expected => return false,

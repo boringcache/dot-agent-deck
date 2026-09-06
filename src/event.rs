@@ -983,7 +983,7 @@ pub struct GetSeedRequest {
     ///
     /// `None` therefore means "the caller could not say", not "the caller is
     /// nobody", and the daemon treats it as such — see
-    /// [`crate::agent_pty::AgentPtyRegistry::take_pending_seed_native`].
+    /// [`crate::agent_pty::AgentPtyRegistry::take_pending_seed_native_for`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
 }

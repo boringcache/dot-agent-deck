@@ -7509,9 +7509,9 @@ impl AgentPtyRegistry {
     /// for — that agent is gone — so the filter costs no legitimate stash.
     ///
     /// The matching reader was the other half, and issue #916 closed it in the
-    /// same PR: [`AgentPtyRegistry::take_pending_seed_native`] resolved a pane
-    /// by UNFILTERED scan, so a `get-seed` pull could land on a dead
-    /// predecessor's record and hand its stale seed to the pane's new occupant.
+    /// same PR: `take_pending_seed_native` resolved a pane by UNFILTERED scan,
+    /// so a `get-seed` pull could land on a dead predecessor's record and hand
+    /// its stale seed to the pane's new occupant.
     /// It now applies the same `exited` filter, and additionally scopes the take
     /// by the caller's own agent id when the caller presents one.
     pub fn set_pending_seed(&self, pane_id_env: &str, seed: &str) {
@@ -7568,9 +7568,17 @@ impl AgentPtyRegistry {
     /// answers from the pane alone. The residual exposure is narrow because of
     /// the uniqueness above: an id-less pull still cannot reach an exited
     /// record. It is not zero — an id-less caller that presents a pane id it
-    /// does not own is still answered — but an id is an env var, so requiring
-    /// one would not have stopped that caller either; it would only have stopped
-    /// the honest one.
+    /// does not own is still answered.
+    ///
+    /// Round-2 audit (finding 4) — what requiring an id would actually have
+    /// bought, stated narrowly. It is NOT nothing: a caller presenting its OWN
+    /// true id and a FOREIGN pane is refused by the `Some(id)` arm below, whose
+    /// filter demands the record hold that pane. So requiring an id would have
+    /// raised the bar from "know the victim's pane id" to "know or guess the
+    /// victim's agent id". What limits the value is that registry ids are
+    /// sequential decimal strings from `"1"` and are therefore cheap to guess,
+    /// so the bar it raises is a low one — while the cost, a lost seed for every
+    /// producer the daemon injected no id into, is certain.
     ///
     /// The `Option` here is NOT the permissive argument issue #617 removed from
     /// the write side. There, `None` silently SKIPPED the identity comparison
@@ -7581,9 +7589,10 @@ impl AgentPtyRegistry {
     /// caller's own pane, not a write into somebody's conversation.
     ///
     /// Named `_for` to match [`Self::take_pending_seed_fallback_for`], whose
-    /// pane-keyed predecessor this mirrors. [`Self::take_pending_seed_native`]
-    /// is retained as the `#[cfg(test)]` probe, for the same reason its sibling
-    /// keeps one.
+    /// pane-keyed predecessor this mirrors. `take_pending_seed_native` is
+    /// retained as the `#[cfg(test)]` probe, for the same reason its sibling
+    /// keeps one. Both names are deliberately unlinked: the probes are
+    /// `#[cfg(test)]`, so a link from here would dangle in rustdoc.
     pub fn take_pending_seed_native_for(
         &self,
         pane_id_env: &str,

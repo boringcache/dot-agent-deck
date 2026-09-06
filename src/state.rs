@@ -1220,8 +1220,34 @@ pub struct AppState {
     /// else's behalf — but they are documented limits, not guarantees. See
     /// [`Self::apply_event`]'s `SessionEnd` branch for the ownership check.
     ///
+    /// **An entry is PERMANENT, and that is the policy rather than a missing
+    /// cleanup.** [`Self::agent_generation_ended`] is a `contains_key`, so from
+    /// the first end onward every unnamed automatic delivery bound to that agent
+    /// is refused *for as long as the pane it targets has no current
+    /// generation* — which is precisely the state the guard exists to refuse,
+    /// and which no elapsed time makes safe. Once a successor announces itself
+    /// the witness stops mattering: [`Self::pane_hook_session`] is populated
+    /// again and the guard's unnamed arm refuses on that check first, and if
+    /// that conversation also ends the witness is correct again. The residual
+    /// availability cost is an agent whose successor `SessionStart` the daemon
+    /// never observes: it is live, in a real conversation, and its unnamed
+    /// automatic deliveries stay refused. Eviction
+    /// would not recover that case. The two places a registry record actually
+    /// goes away — `AgentPtyRegistry::close_agent` and the replace-in-place
+    /// inside `respawn_agent_for_pane` — both retire the agent as they remove
+    /// it, so by the time an eviction hooked there could fire, `write_guarded`
+    /// is already refusing that id as `NoLiveTarget` before this is ever read.
+    /// An agent that merely exits keeps its record (flagged `exited`) and so
+    /// would not be evicted by either hook anyway. The one `.remove()` this map
+    /// has is the snapshot-and-restore inside [`Self::apply_daemon_report_event`]
+    /// — not a cleanup path, exactly the shape
+    /// [`Self::pane_generation_closures`] has.
+    ///
     /// Monotonic per agent, `u64`, in memory only; it grows by one per real
-    /// conversation end, bounded by the agents this daemon ever spawned.
+    /// conversation end. The keys are registry-minted ids this daemon confirmed
+    /// ownership of, so neither the entry count nor the key length is
+    /// caller-steerable; the count is bounded by the conversations ended by
+    /// agents this daemon spawned.
     agent_generation_closures: HashMap<String, u64>,
 }
 
@@ -5538,10 +5564,12 @@ impl AppState {
     /// read to an in-flight TUI delivery bound to the genuine successor as a
     /// changed target and abandoned it.
     ///
-    /// Rather than reason about which stamping choices happen to be inert, the
-    /// generation entry is snapshotted and restored around the apply. That makes
-    /// "a delivery report never moves the generation, forward or backward" a
-    /// property of this function instead of a property of the caller's timing,
+    /// Rather than reason about which stamping choices happen to be inert, every
+    /// piece of state that records a generation transition is snapshotted and
+    /// restored around the apply — the pane's generation entry, its closure
+    /// count, and (issue #915) the agent-keyed ended-generation witness. That
+    /// makes "a delivery report never moves the generation, forward or backward"
+    /// a property of this function instead of a property of the caller's timing,
     /// and it holds for the placeholder-only pane the old comment listed as a
     /// residual (stamping a card id where no generation existed established one).
     ///
@@ -5550,6 +5578,23 @@ impl AppState {
     /// visible exactly like any other event on that card.
     pub fn apply_daemon_report_event(&mut self, event: AgentEvent) {
         let pane_id = event.pane_id.clone();
+        // Issue #915 round-2 audit (finding 3): the AGENT-keyed witness is
+        // snapshotted for the same reason as the two pane-keyed entries below,
+        // and it is the one whose absence would cost the most. The pane-keyed
+        // closure count is a COUNTER compared against a snapshot, so a spurious
+        // bump abandons one delivery; `agent_generation_closures` is a LATCH, so
+        // a spurious bump refuses that agent's every later unnamed automatic
+        // delivery for the daemon's remaining lifetime. Not reachable today —
+        // the only production caller (`install_delivery_notice_sink`) synthesizes
+        // an `EventType::Error`, which never enters the `SessionEnd` branch that
+        // writes this — but "a delivery report never moves the generation" is
+        // meant to be a property of THIS function rather than of what its callers
+        // happen to synthesize, and the third map records the same transition as
+        // the first two.
+        let agent_id = event.agent_id.clone();
+        let agent_closures_before = agent_id
+            .as_ref()
+            .and_then(|agent| self.agent_generation_closures.get(agent).copied());
         let before = pane_id
             .as_ref()
             .and_then(|pane| self.pane_hook_session.get(pane).cloned());
@@ -5576,6 +5621,16 @@ impl AppState {
                 }
                 None => {
                     self.pane_generation_closures.remove(&pane);
+                }
+            }
+        }
+        if let Some(agent) = agent_id {
+            match agent_closures_before {
+                Some(count) => {
+                    self.agent_generation_closures.insert(agent, count);
+                }
+                None => {
+                    self.agent_generation_closures.remove(&agent);
                 }
             }
         }
@@ -5739,10 +5794,19 @@ impl AppState {
     ///
     /// The daemon's write guard reads this to tell a genuinely sessionless agent
     /// (never any generation → accept, the carve-out) from one whose
-    /// conversation has just closed and whose successor generation has not
-    /// announced itself yet (→ refuse). `false` for an agent this daemon has
-    /// seen no `SessionEnd` for, which includes every producer that named no
-    /// agent id — see the type's docs for that fail-open limit.
+    /// conversation has closed and whose successor generation has not announced
+    /// itself (→ refuse). `false` for an agent this daemon has recorded no
+    /// confirmed `SessionEnd` for, which includes every producer that named no
+    /// agent id and every event whose named agent did not hold the named pane —
+    /// see the type's docs for those two fail-open limits.
+    ///
+    /// **"Ever" is literal: this latches, and no path clears it as cleanup.**
+    /// The refusal it drives is nonetheless conditional, because the guard reads
+    /// it only after finding the pane has NO current generation — so a successor
+    /// that announces itself takes the decision away from this witness
+    /// entirely. See
+    /// [`Self::agent_generation_closures`] for why permanence is the policy and
+    /// what it costs.
     pub fn agent_generation_ended(&self, agent_id: &str) -> bool {
         self.agent_generation_closures.contains_key(agent_id)
     }
@@ -7649,6 +7713,17 @@ impl AppState {
                 //   closure. That is the launcher case #424 exists for: the first
                 //   genuine announcement after our write is the conversation we
                 //   are still trying to reach, not one we missed.
+                //
+                // Issue #915 round-2 audit (finding 2): this site deliberately
+                // does NOT also call `note_agent_generation_closed`, and the
+                // asymmetry with the `SessionEnd` branch above is not an
+                // omission. The agent-keyed witness exists only to disambiguate
+                // an EMPTY `pane_hook_session`, and a rollover leaves one
+                // populated — the successor generation is inserted immediately
+                // below — so the unnamed arm of the write guard refuses on its
+                // first check (`pane_hook_session_id(...).is_some()`) without
+                // ever consulting the witness. Recording one here would change
+                // no decision.
                 if announces_generation
                     && self
                         .pane_hook_session
