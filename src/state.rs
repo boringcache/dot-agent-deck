@@ -7088,14 +7088,24 @@ impl AppState {
         //
         // Residual, by construction: because the producer key is STABLE, the one
         // card changing hands means a close target armed against Pi generation N
-        // still RESOLVES after generation N+1 takes over — it now resolves to the
-        // replacement rather than to a stale corpse. Fixing that belongs at the
-        // close-target seam (arm on generation, not on session id alone), not
-        // here: the alternative — deleting the card so the armed id reads as
-        // vanished — would leave ZERO cards on a live pane, which is exactly the
-        // failure `status/supersede/003` forbids one screen up. Distinct-session
-        // supersession is unaffected and still vanishes the armed id
-        // (`status/supersede/002`, `prompt/close-confirm/005`).
+        // still RESOLVES after generation N+1 takes over — it resolves to the
+        // replacement rather than to a stale corpse. That was FIXED at the
+        // close-target seam by issue #317, exactly where this comment said it
+        // belonged: `CloseTarget::Session` now carries the `agent_id` alongside
+        // the session id and `resolve_close_plan` reads a refreshed identity as
+        // vanished (`prompt/close-confirm/009`). It was deliberately not fixed
+        // here — the alternative, deleting the card so the armed id reads as
+        // vanished, would leave ZERO cards on a live pane, which is exactly the
+        // failure `status/supersede/003` forbids one screen up.
+        //
+        // The refresh below is what makes that fix possible, so the two are
+        // coupled: `ui::same_generation` decides on a differing `Some` → `Some`
+        // and on nothing else, which is the SAME test this branch applies. Keep
+        // them in step — a card that changes hands here must read as vanished
+        // there, and a `None` learning an identity must not, or an ordinary
+        // close silently stops working. Distinct-session supersession is
+        // unaffected and still vanishes the armed id (`status/supersede/002`,
+        // `prompt/close-confirm/005`).
         if claims_generation
             && let Some(incoming_agent_id) = event.agent_id.as_deref()
             && self.sessions.get(&event.session_id).is_some_and(|session| {
