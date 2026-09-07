@@ -41,7 +41,14 @@
 #   DAD_LINK_JOBS=N   use N link slots instead of the computed default
 #   DAD_LINKER=clang  use a different linker driver (this config entry
 #                     overrides whatever `linker` a personal
-#                     `~/.cargo/config.toml` sets, so this puts it back)
+#                     `~/.cargo/config.toml` sets, so this puts it back).
+#                     Also suppresses the mold injection below.
+#   DAD_NO_MOLD=1     keep the default linker even where mold is installed,
+#                     for bisecting a suspected linker difference. Only the
+#                     exact value `1` opts out.
+#
+# The canonical table is docs/develop/build-gate.md's "Escape hatches"; keep
+# the two in step.
 set -u
 
 linker="${DAD_LINKER:-cc}"
