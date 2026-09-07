@@ -52,6 +52,12 @@ const REPORT_FRAME_NEEDLE: &str = "[UNTRUSTED-WORKER-REPORT:";
 /// collapse and the frame-breaking filter unchanged.
 const SENTINEL: &str = "e2e-unsolicited-report-4b7d";
 
+/// How long each needle of the daemon's one wrapped label has to become
+/// visible in the rendered pane. Carried over from the 20s the first of these
+/// waits already used, and shared by the rest so the paint-order gap issue
+/// #818 measured cannot outrun a later needle's budget.
+const PANE_PAINT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Drop every whitespace run, so a needle that straddles the pane's wrap column
 /// still matches text that is fully on screen.
 fn squeeze(text: &str) -> String {
@@ -231,24 +237,64 @@ fn work_done_004_unsolicited_completion_is_visibly_labelled_in_the_attached_tui(
 
     // Then: does it reach the user's screen? A long daemon-injected line has to
     // survive the orchestration surface's wrapping to be worth anything.
+    //
+    // Every POSITIVE check below polls, and that is issue #818 rather than
+    // caution. The daemon writes one long label and the surface wraps it over
+    // several rows, so the needles become visible in PAINT ORDER rather than
+    // together — and `UNSOLICITED_NEEDLE` above is the FIRST of them. A
+    // single-shot `pane_contains` behind that wait therefore reads a frame the
+    // test has already proved is mid-paint, which is why the assertions were
+    // correct and the screen simply had not caught up.
+    //
+    // Measured on this branch by polling, from the instant the wait above
+    // returned, for how long each later needle stayed ABSENT. Under a 96-way
+    // CPU load, `SENTINEL` — the last thing painted — was still absent for a
+    // further 27.6ms and 37.4ms in 2 of 5 runs, while `DAEMON_CLAUSE` and
+    // `REPORT_FRAME_NEEDLE` were already there. Read those two figures only as
+    // "a real window exists, of order tens of ms": the sub-millisecond numbers
+    // the same probe reported for the other needles are dominated by the cost
+    // of the three sequential `snapshot_grid` calls, so this measures presence
+    // and absence rather than paint latency.
+    //
+    // That window is what a single-shot read loses: it evaluates its predicate
+    // roughly one grid snapshot after that instant, so in those 2 runs it would
+    // have read `SENTINEL` as absent. A 4-vCPU runner inside a full tier
+    // starves the deck's render loop far harder than a loaded 16-core box, and
+    // that is what `e2e-deterministic` hit — the captured grid showed the
+    // framing painted and cut off immediately before the sentinel.
+    //
+    // NOT reproduced as a local red on the old code: 0 of 8 solo runs under the
+    // same load, which is consistent with the ~2-in-5 window above only firing
+    // when the check lands inside it. The justification here is the measured
+    // window plus that CI grid, not a local red-to-green.
+    //
+    // Bounded, so a label that genuinely never arrives still fails rather than
+    // hanging, and the timeout is shared with the wait above because these are
+    // rows of one write rather than independent events.
     assert!(
-        wait_for_pane_string(&deck, UNSOLICITED_NEEDLE, Duration::from_secs(20)),
+        wait_for_pane_string(&deck, UNSOLICITED_NEEDLE, PANE_PAINT_TIMEOUT),
         "the unsolicited label reached the orchestrator's PTY but never became visible in the \
          rendered orchestration surface\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        pane_contains(&deck, DAEMON_CLAUSE),
+        wait_for_pane_string(&deck, DAEMON_CLAUSE, PANE_PAINT_TIMEOUT),
         "the label must identify itself as a daemon report, not as a message from a person or an \
          agent\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
     assert!(
-        pane_contains(&deck, REPORT_FRAME_NEEDLE) && pane_contains(&deck, SENTINEL),
+        wait_for_pane_string(&deck, REPORT_FRAME_NEEDLE, PANE_PAINT_TIMEOUT)
+            && wait_for_pane_string(&deck, SENTINEL, PANE_PAINT_TIMEOUT),
         "the worker's own report must still reach the orchestrator, framed as untrusted \
          data\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
+    // Deliberately NOT a wait: this is a negative check, and polling for an
+    // absence would pass on the first frame that has not painted it yet —
+    // vacuously, and most easily on exactly the starved runner this test keeps
+    // failing on. It is sound as a single read because the three waits above
+    // have just proved this write finished painting.
     assert!(
         !pane_contains(&deck, POINTER_NEEDLE),
         "the orchestrator was pointed at a summary file that was never written — the #433 \
