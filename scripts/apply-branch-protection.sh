@@ -106,8 +106,16 @@ RENOVATE_APP_ID="${RENOVATE_APP_ID:-2740}"
 #
 # `-` rather than `:-`, unlike the tunables above: with `:-` an explicitly empty
 # value falls back to the default, which would make that escape hatch a dead
-# end. Unset still means "the four defaults".
-REQUIRED_CHECKS="${REQUIRED_CHECKS-build build-macos build-windows security}"
+# end. Unset still means "the five defaults".
+#
+# `e2e-deterministic` joined the required set deliberately, replacing the
+# advisory arrangement this script's comments used to describe. It earned it by
+# catching a real defect rather than a flake: `inline_001_rename_save_commits`
+# asserted a rename that never happened and passed only by racing a stale
+# frame, which no other gate could see. The cost is the one this file already
+# warns about two paragraphs up — it is a fifth name a fork's CI must produce,
+# and the ALLOW_NO_REQUIRED_CHECKS escape hatch covers that case unchanged.
+REQUIRED_CHECKS="${REQUIRED_CHECKS-build build-macos build-windows security e2e-deterministic}"
 
 # Acknowledge that an empty REQUIRED_CHECKS is intended. Without this set to
 # `true`, an empty (or whitespace-only) REQUIRED_CHECKS is a hard error rather
@@ -305,6 +313,7 @@ payload() {
         "dismiss_stale_reviews_on_push": true,
         "require_last_push_approval": false,
         "required_review_thread_resolution": true,
+        "require_extra_approval_for_unattributed_changes": true,
         "allowed_merge_methods": ["merge", "squash", "rebase"]
       }
     }$checks_rule
