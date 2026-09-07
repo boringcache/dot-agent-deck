@@ -50,7 +50,27 @@ pub const QUIESCENT_IDLE_MS: u64 = 50;
 
 /// Default ceiling on quiescence / signal waits. Tests do not pass a
 /// budget — quiescence and string-signal waits are bounded internally.
-const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// **30s, raised from 10s on 2026-09-07 (issues #351, #818).** The lane-1 tier
+/// intermittently stalls one arbitrary test on a `ubuntu-latest` runner: two
+/// consecutive `e2e-deterministic` attempts on the SAME tree failed a
+/// different test each time — `pane_input_007` at 20.9s and `inline_001` at
+/// 18.3s — each waiting on a string a healthy run paints in under 2s. That is
+/// issue #351's "different file each run" signature. It is not a slower
+/// runner: across the 2653 tests those reports share with a local run, the
+/// median CI/local per-test ratio is 0.96x, and `pane_input_007` is FASTER on a
+/// healthy runner (1.54s) than locally (1.94s). A 10s ceiling sat underneath
+/// both stalls; 30s rides over the two that have been measured.
+///
+/// A healthy run pays NOTHING for the headroom: every wait bounded by this
+/// constant returns as soon as its condition holds, so only a failing wait
+/// spends the budget. The cost is that a genuine break takes 30s rather than
+/// 10s to surface, against a tier whose wall clock is set by one ~288s test.
+/// This widens patience, not tolerance — no assertion is weakened and a real
+/// regression still fails. If stalls are later measured ABOVE 30s, the next
+/// lever is a nextest `retries` override (see `.config/nextest.toml`), not
+/// another blind widening of this constant.
+const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max-lifetime cap for tests that spawn `dot-agent-deck wrap` DIRECTLY (rather
 /// than through [`TuiDeck`] / `DaemonProc`, which inject their own cap), so a
