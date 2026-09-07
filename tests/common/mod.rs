@@ -87,9 +87,9 @@ pub const CHILD_BOOT_BASE: Duration = Duration::from_secs(8);
 /// by the `libc` crate for either `linux-gnu` or `apple` targets, and shelling
 /// out to `sysctl` from a test helper buys a process spawn on every wait to
 /// refine a number that is only ever used to make a ceiling MORE generous.
-/// Elsewhere the answer is `None` and [`load_scaled`] applies the full
-/// multiplier, which is the safe direction: a wider ceiling on a machine whose
-/// contention cannot be measured, paid only when a child is genuinely slow.
+/// Elsewhere the answer is `None`, and [`load_scaled`] then applies NO
+/// multiplier at all — see [`load_factor`] for why an unmeasurable load is not
+/// treated as a maximal one.
 pub fn machine_load_per_cpu() -> Option<f64> {
     if !cfg!(target_os = "linux") {
         return None;
@@ -113,10 +113,14 @@ pub fn machine_load_per_cpu() -> Option<f64> {
 /// assertion's diagnostics — the thing every widened wait here exists to
 /// preserve. At the measured failure's load (44 on 16 cores = 2.75) this yields
 /// 22 s against the 2 s that failed; the cap only binds past 6.0.
-const MAX_LOAD_FACTOR: f64 = 6.0;
+pub(crate) const MAX_LOAD_FACTOR: f64 = 6.0;
 
 /// Issue #709: widen a wait ceiling in proportion to how contended the machine
 /// is, so a fast box still fails fast and a loaded one still passes.
+///
+/// Where the load cannot be measured at all — every non-Linux target — the base
+/// is returned unscaled rather than at the maximum multiplier. [`load_factor`]
+/// carries that reasoning and the measurement behind it.
 ///
 /// Apply this ONLY to a ceiling on something that must HAPPEN, never to a
 /// negative window in which something must NOT happen: the waits it feeds return
@@ -125,10 +129,49 @@ const MAX_LOAD_FACTOR: f64 = 6.0;
 /// window is the opposite — it is always paid in full, and its length is part of
 /// what the test asserts.
 pub fn load_scaled(base: Duration) -> Duration {
-    let factor = machine_load_per_cpu()
-        .unwrap_or(MAX_LOAD_FACTOR)
-        .clamp(1.0, MAX_LOAD_FACTOR);
-    base.mul_f64(factor)
+    base.mul_f64(load_factor(machine_load_per_cpu()))
+}
+
+/// The factor [`load_scaled`] multiplies its base by, split out from it so the
+/// non-Linux branch is testable on Linux — where [`machine_load_per_cpu`] never
+/// returns `None`, and so where the interesting case is otherwise unreachable.
+///
+/// **An UNMEASURABLE load yields 1.0, not [`MAX_LOAD_FACTOR`].** This function
+/// widens a ceiling in proportion to *measured* contention; `None` is the
+/// absence of a measurement, not evidence of a loaded machine, so the honest
+/// answer is to leave the base alone. Treating it as maximal contention — which
+/// is what an earlier `unwrap_or(MAX_LOAD_FACTOR)` here did — multiplied every
+/// `load_scaled` wait by 6 on **every** macOS and Windows run, idle or not,
+/// because `machine_load_per_cpu` is Linux-only by construction. That is the
+/// largest possible error rather than a safe default: the true factor on an idle
+/// box is exactly 1.0.
+///
+/// The cost was never on the happy path — these waits return the instant their
+/// condition holds — but it was real on the FAILING path, which is the path that
+/// matters, because a widened ceiling is paid in full there. It made a genuine
+/// fast-tier failure take 48s instead of 8s to report on macOS, and the 6x was
+/// never measured to be needed there: issue #709's starvation was measured on a
+/// 16-core **Linux** box at load average 44, where the measurement works and the
+/// scaling still applies. `build-macos` runs `cargo nextest run --workspace`, so
+/// this was being paid on every macOS CI run. (Windows never was — the fast-tier
+/// callers are all `cfg(unix)`.)
+///
+/// Reverting the fallback cannot regress macOS relative to its own history. The
+/// waits #709 converted were flat, unscaled ceilings before it, on every
+/// platform including macOS, and every base here is at least as generous as the
+/// number it replaced: [`CHILD_BOOT_BASE`] is 8s against the `from_secs(2)` and
+/// `from_secs(5)` deadlines it took over — 1.6-4x — and the one sub-second base,
+/// `delegate_prompt_injection`'s 1200 ms `POINTER_DELIVERY_SLACK`, is unchanged
+/// from the value that was inlined before it. So an unscaled macOS run is the
+/// pre-#709 configuration or better, and that configuration was green.
+///
+/// A non-finite input is likewise unmeasurable and yields 1.0, so this is total
+/// and no caller can hand [`Duration::mul_f64`] a `NaN` to panic on.
+pub(crate) fn load_factor(load_per_cpu: Option<f64>) -> f64 {
+    match load_per_cpu {
+        Some(load) if load.is_finite() => load.clamp(1.0, MAX_LOAD_FACTOR),
+        _ => 1.0,
+    }
 }
 
 /// Issue #709: [`load_scaled`] applied to [`CHILD_BOOT_BASE`] — the ceiling a

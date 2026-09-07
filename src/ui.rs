@@ -13305,7 +13305,6 @@ pub fn run_tui(
                 tick,
                 has_pane_control,
                 &*pane,
-                pane_layout,
                 &tab_view,
                 &tab_bar_info,
                 &frame_layout,
@@ -15694,7 +15693,6 @@ fn render_frame(
     tick: u64,
     has_pane_control: bool,
     pane_controller: &dyn PaneController,
-    pane_layout: PaneLayout,
     tab_view: &ActiveTabView,
     tab_bar: &TabBarInfo,
     layout: &FrameLayout,
@@ -15814,17 +15812,16 @@ fn render_frame(
     // frame (see the Orchestration arm of `compute_frame_layout`), and reading
     // the value the geometry actually used is what makes "the rects were split
     // one way and the panes drawn another" unrepresentable — there is exactly
-    // one `if zoomed` in the layout, and no second one here. The `pane_layout`
-    // argument is the deck's STORED toggle (`ui.pane_layout`); a Mode tab
-    // carries no pane layout of its own and returns below before this is read.
-    let pane_layout = match &layout.content {
-        FrameContent::Cards { pane_layout, .. } => *pane_layout,
-        FrameContent::Mode { .. } => pane_layout,
-    };
-
+    // one `if zoomed` in the layout, and no second one here. Issue #749: it is
+    // bound in the SAME destructure as the rects it has to agree with, so no
+    // other layout value is in scope for this function to reach for by
+    // accident — the single source is compiler-enforced, not conventional. A
+    // Mode tab carries no pane layout of its own and returns before the binding
+    // exists, which is why this cannot be resolved above the branch.
+    //
     // Branch on the content the layout pass resolved. Mode tabs render and
     // return here; dashboard / orchestration fall through to the card grid.
-    let (dashboard_area, panes_area, pane_ids, pane_rects) = match &layout.content {
+    let (dashboard_area, panes_area, pane_ids, pane_rects, pane_layout) = match &layout.content {
         FrameContent::Mode {
             agent_area,
             side_area,
@@ -15864,8 +15861,14 @@ fn render_frame(
             panes_area,
             pane_ids,
             pane_rects,
-            ..
-        } => (*dashboard_area, *panes_area, pane_ids, pane_rects),
+            pane_layout,
+        } => (
+            *dashboard_area,
+            *panes_area,
+            pane_ids,
+            pane_rects,
+            *pane_layout,
+        ),
     };
 
     // PRD #84: the OUTER rect each pane in the right column was sized to this
@@ -20954,17 +20957,7 @@ pub fn render_orchestration_frame_to_buffer(
     terminal
         .draw(|frame| {
             render_frame(
-                frame,
-                &state,
-                &mut ui,
-                &filtered,
-                0,
-                true,
-                &ctrl,
-                PaneLayout::Stacked,
-                &tab_view,
-                &tab_bar,
-                &layout,
+                frame, &state, &mut ui, &filtered, 0, true, &ctrl, &tab_view, &tab_bar, &layout,
             );
         })
         .expect("TestBackend draw should succeed");
@@ -23149,16 +23142,7 @@ mod tests {
                     .map(|(_, r)| *r);
 
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 );
             })
@@ -26417,16 +26401,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -26508,16 +26483,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -26650,16 +26616,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -27012,16 +26969,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -27106,16 +27054,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
@@ -27175,16 +27114,7 @@ mod tests {
                     1,
                 );
                 render_frame(
-                    frame,
-                    &state,
-                    &mut ui,
-                    &filtered,
-                    0,
-                    false,
-                    &noop,
-                    PaneLayout::Stacked,
-                    &tab_view,
-                    &tab_bar,
+                    frame, &state, &mut ui, &filtered, 0, false, &noop, &tab_view, &tab_bar,
                     &layout,
                 )
             })
