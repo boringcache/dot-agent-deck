@@ -156,11 +156,14 @@ pub fn load_scaled(base: Duration) -> Duration {
 /// this was being paid on every macOS CI run. (Windows never was — the fast-tier
 /// callers are all `cfg(unix)`.)
 ///
-/// Reverting the fallback cannot regress macOS relative to its own history: the
-/// three waits #709 converted were flat, unscaled `Duration::from_secs(2)` and
-/// `from_secs(5)` ceilings before it, on every platform including macOS, and
-/// [`CHILD_BOOT_BASE`] unscaled is 8s — 1.6-4x more generous than the numbers
-/// macOS CI was already green with.
+/// Reverting the fallback cannot regress macOS relative to its own history. The
+/// waits #709 converted were flat, unscaled ceilings before it, on every
+/// platform including macOS, and every base here is at least as generous as the
+/// number it replaced: [`CHILD_BOOT_BASE`] is 8s against the `from_secs(2)` and
+/// `from_secs(5)` deadlines it took over — 1.6-4x — and the one sub-second base,
+/// `delegate_prompt_injection`'s 1200 ms `POINTER_DELIVERY_SLACK`, is unchanged
+/// from the value that was inlined before it. So an unscaled macOS run is the
+/// pre-#709 configuration or better, and that configuration was green.
 ///
 /// A non-finite input is likewise unmeasurable and yields 1.0, so this is total
 /// and no caller can hand [`Duration::mul_f64`] a `NaN` to panic on.
