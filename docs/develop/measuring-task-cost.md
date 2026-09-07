@@ -26,9 +26,9 @@ For every `cargo fmt`, `cargo clippy`, `cargo test-fast`, `cargo build` and any 
 |---|---|
 | wall / user / sys / %CPU / **max RSS** / FS in / FS out | `/usr/bin/time -v`, pasted verbatim |
 | **UTC start and end** | epoch seconds *and* human time. Without these, gates cannot be aligned across agents or against the box sampler |
-| **units rebuilt** | from cargo's own output. This is the normaliser — without it "67s versus 8.8s" is uninterpretable rather than informative |
+| **units rebuilt** | *compiling gates only* — `cargo clippy`, `cargo test-fast`, `cargo build`, e2e runs — from cargo's own output. This is the normaliser: without it "67s versus 8.8s" is uninterpretable rather than informative. **`cargo fmt` compiles nothing and emits no such count; record `n/a` for it** rather than inventing a zero, which would read as "a warm no-op rebuild" and average in as one |
 | **cold or warm** | state explicitly whether *this worktree's* `target/` was populated before the gate. A fresh dispatch worktree starts **cold** |
-| PSI before and after | `/proc/pressure/{io,memory,cpu}` |
+| PSI before and after | `/proc/pressure/{io,memory,cpu}`. **Required at N=1 only. Exempt whenever a coordinator sampler is running** — PSI is machine-wide and `/proc/pressure` has no per-process view at all, so at N>1 an agent reporting it would be making exactly the whole-box claim the concurrency section below forbids, attributed to one agent. Write `see box sampler` and move on; [`sample-box.sh`](../../scripts/sample-box.sh) already captures it at a fixed interval, and your mandatory UTC timestamps are what join the two |
 | `uptime` before and after | every number must carry its load average, so a contended sample is never silently compared against a quiet one |
 | bucket | **"my change"** or **"a pre-existing defect"** — see below |
 
@@ -44,7 +44,19 @@ The single most useful number the #749 run produced: **41% of its local gate wal
 
 ## Link-gate queueing
 
-`scripts/link-gate.sh` takes a slot from a machine-wide pool via `scripts/build-gate.sh`; the budget is one slot per 4 GiB RAM, clamped to core count (**6** on a 27 GiB / 16-core box). Sample the counters and report **queue depth**, not just occupancy: a line reading `ld=10 … slots_held=6/6` means four linkers are not holding a slot. Note the mapping is approximate — `ld`/`collect2` nesting means the counts are indicative rather than exact — and say so rather than presenting it as precise.
+`scripts/link-gate.sh` takes a slot from a machine-wide pool via `scripts/build-gate.sh`; the budget is one slot per 4 GiB RAM, clamped to core count (**6** on a 27 GiB / 16-core box). Sample the counters and report **queue depth**, not just occupancy.
+
+**Queue depth is counted from the gate's own processes, not from `ld`, and the difference is not a nicety.** `build-gate.sh` acquires its slot *before* it runs the command, so a link waiting for a slot has spawned no driver, no `collect2` and no `ld` yet — a waiting gate process has no children at all between its 2s `flock` retries. So `ld` minus slots held cannot count a waiter even in principle: it reads **0 in precisely the contended case the metric exists to catch**. Measured on a deliberately contended pool — one holder, two waiters, one slot — `ld=0 slots_held=1`, so that subtraction clamps to `queue_depth=0` while two jobs were genuinely queued. `sample-box.sh` therefore counts `build-gate.sh` processes for the pool (`gated`) and reports `queue_depth = gated - slots_held`, which reported the true `2`.
+
+Three columns, and they mean different things:
+
+| column | meaning |
+|---|---|
+| `gated` | gate processes for the pool: waiting **plus** running. Needs no `fuser`, so it is the one to read if `slots_held` is unavailable |
+| `queue_depth` | `gated - slots_held` — links actually **waiting** for a slot |
+| `ungated_ld` | `ld - slots_held` — the old formula, kept under a name that says what it measures: linkers running **without** a slot, i.e. the [degradation ladder](build-gate.md) in use (`DAD_LINK_JOBS=0`, no `flock`, or the 900s wait budget expiring). Not a queue |
+
+Still indicative rather than exact, and say so: a gate process is counted from the moment it starts, so one sampled in the microseconds before it takes a free slot reads as queued for that sample, and `ld`/`collect2` nesting keeps `ungated_ld` fuzzy. `toolchain_rss_kB_min` is a **lower bound** for the same reason — `comm` matching cannot be exhaustive, and a name the list does not carry is indistinguishable from an idle box. `sample-attribution.sh`'s `rss_kB_min` carries the same caveat and the same `comm` list; the driver reports `comm=gcc` even when invoked as `cc`, so matching `cc` alone matches nothing.
 
 `build-gate.sh` logs only when its 900s wait budget expires, so an individual link's wait is not directly observable without changing that script. **Do not change it** to get a number: it is the linker for every build on the machine, and modifying it during a measurement alters what is being measured.
 
@@ -53,7 +65,7 @@ The single most useful number the #749 run produced: **41% of its local gate wal
 When the invocation names a level (N=1, N=3, N=5):
 
 - **Dispatching N units together does not make them work together.** Agents drift out of phase within minutes, and the expensive gates are a small fraction of wall time, so a level labelled N=2 can contain almost no real contention. Condition the analysis on *measured* overlap — intersect the UTC gate windows — and report the overlap fraction as a first-class number. Gates that did not overlap are two more N=1 samples and must not be averaged in as if they were contended. If overlap turns out to be rare, that is itself the finding. [`scripts/sample-attribution.sh`](../../scripts/sample-attribution.sh) measures it from the box side, independently of what agents self-report.
-- **Report only your own processes.** Do not attempt machine-wide claims — with several agents running you cannot see the box, and an inference will be wrong. Whole-box state (PSI, `MemAvailable`, load, disk, total RSS, pool occupancy) is captured separately by [`scripts/sample-box.sh`](../../scripts/sample-box.sh), run by the coordinator, and correlated with your gates by timestamp. This is why UTC timestamps are mandatory.
+- **Report only your own processes**, which is why PSI is exempt from the per-gate table above whenever a coordinator sampler is running. Do not attempt machine-wide claims — with several agents running you cannot see the box, and an inference will be wrong. Whole-box state (PSI, `MemAvailable`, load, disk, total RSS, pool occupancy) is captured separately by [`scripts/sample-box.sh`](../../scripts/sample-box.sh), run by the coordinator, and correlated with your gates by timestamp. This is why UTC timestamps are mandatory.
 - **`time -v`'s max RSS is the largest single process, not a sum.** At N>1 total memory is the binding constraint and only the box sampler can see it. Do not present your peak as the machine's.
 - **Record your own start time** so "N=3" means three agents actually overlapping, rather than one finishing before another began.
 

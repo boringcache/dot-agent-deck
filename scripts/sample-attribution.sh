@@ -37,7 +37,7 @@ done
 case "$interval" in ''|*[!0-9]*|0) echo "--interval must be a positive integer" >&2; exit 2 ;; esac
 
 if [ ! -e "$out" ]; then
-    printf 'epoch\tiso\tworktree\tprocs\trss_kB\tbuilding\n' > "$out"
+    printf 'epoch\tiso\tworktree\tprocs\trss_kB_min\tbuilding\n' > "$out"
 fi
 
 echo "sample-attribution.sh: sampling every ${interval}s into $out" >&2
@@ -50,8 +50,15 @@ while :; do
     # comm + pid + rss for every toolchain process, then resolve cwd per pid.
     # A process that exits between the ps and the readlink simply drops out;
     # that is a sampling miss, not an error, so failures are silent.
+    #
+    # Same comm list as sample-box.sh's toolchain_rss_kb, and a LOWER BOUND for
+    # the same reason -- the driver reports `comm=gcc` even when invoked as
+    # `cc`, so matching only `cc` matches nothing; a name not listed here
+    # contributes nothing and looks like an idle worktree. Keep the two lists
+    # in step: they are compared against each other during a run.
     ps -eo pid=,comm=,rss= 2>/dev/null | awk '
-        $2=="rustc"||$2=="cargo"||$2=="ld"||$2=="ld.lld"||$2=="collect2"||$2=="cc1"||$2=="cc1plus"||$2=="mold" {print $1, $3}' \
+        $2=="rustc"||$2=="cargo"||$2=="ld"||$2=="ld.lld"||$2=="collect2"||$2=="cc1"||$2=="cc1plus"||$2=="mold"||
+        $2=="cc"||$2=="gcc"||$2=="clang"||$2=="c++"||$2=="g++"||$2=="clang++" {print $1, $3}' \
     | while read -r pid rss; do
         cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || continue
         printf '%s\t%s\n' "$cwd" "$rss"

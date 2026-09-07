@@ -39,8 +39,9 @@ case "$interval" in
     0) echo "sample-box.sh: --interval must be greater than 0" >&2; exit 2 ;;
 esac
 
-# The link pool build-gate.sh uses. Occupancy is counted as slot files held,
-# which is what makes queue depth (linkers minus slots) meaningful.
+# The link pool build-gate.sh uses. Occupancy is counted as slot files held;
+# queue depth is gated processes minus that, NOT linkers minus that -- see
+# gate_procs below for why `ld` cannot see a waiter.
 pool="${DAD_BUILD_GATE_DIR:-/tmp/dad-build-gate-$(id -u)}/link"
 
 # $1 = cpu|io|memory, $2 = some|full -> avg10 as a bare number.
@@ -59,26 +60,69 @@ psi() {
 
 # Sum RSS in kB over every process whose comm matches the toolchain. This is
 # the number no agent can report.
+#
+# A LOWER BOUND, not a total, and the column is named that way. comm matching
+# cannot be exhaustive: a name this list does not carry contributes nothing and
+# looks identical to an idle box. Known gaps left uncounted on purpose -- a
+# versioned driver (`gcc-15`), `rust-lld`, `ld.gold`, a distro wrapper script,
+# and the gate's own `bash` processes.
+#
+# THE DRIVER IS `gcc`, NOT `cc`, and that is measured rather than assumed.
+# `link-gate.sh` execs `$DAD_LINKER` (default `cc`), but `cc` is a symlink to
+# `gcc` and the wrapper re-execs the real binary, so the live process reports
+# `comm=gcc` while its argv still says `cc`. Matching only `cc` -- the obvious
+# reading -- therefore matches NOTHING on this box. Both names are listed
+# because `DAD_LINKER=clang` is a supported override, and the driver holds real
+# memory at the head of every gated link pipeline.
 toolchain_rss_kb() {
     ps -eo comm=,rss= 2>/dev/null | awk '
         $1 == "rustc" || $1 == "cargo" || $1 == "ld" || $1 == "ld.lld" ||
-        $1 == "collect2" || $1 == "cc1" || $1 == "cc1plus" || $1 == "mold" { s += $2 }
+        $1 == "collect2" || $1 == "cc1" || $1 == "cc1plus" || $1 == "mold" ||
+        $1 == "cc" || $1 == "gcc" || $1 == "clang" ||
+        $1 == "c++" || $1 == "g++" || $1 == "clang++" { s += $2 }
         END { print s + 0 }'
 }
 
 count() { pgrep -x "$1" 2>/dev/null | wc -l | tr -d ' '; }
 
+# Count the gate's own processes for a pool: every build-gate.sh that is either
+# holding a slot or waiting for one.
+#
+# WHY THIS EXISTS, AND WHY `ld` CANNOT ANSWER IT. build-gate.sh acquires a slot
+# BEFORE it runs the command, so a link waiting for a slot has spawned no
+# driver, no `collect2` and no `ld` -- measured: a waiting gate process has no
+# children at all between its 2s `flock` retries. So `ld` minus slots held is
+# structurally incapable of counting a waiter, and in the contended case the
+# metric exists to catch it reads 0. Counting the gate processes themselves is
+# the view that does see them, because the bash process persists for the whole
+# wait and for the whole run.
+#
+# MATCHED ON argv, NOT comm, and anchored. A `#!/usr/bin/env bash` script
+# reports `comm=bash`, so `pgrep -x build-gate.sh` returns 0 -- measured. A
+# bare `pgrep -f build-gate.sh` over-counts instead: it matches any shell whose
+# own command line merely mentions the script, including the coordinator's.
+# Anchoring to `<interpreter> <path>/build-gate.sh ... --pool <pool>` and
+# requiring the pool to match excludes both. Verified against a live pool: 0
+# with nothing gated, 1 for a lone holder, 3 for one holder plus two waiters,
+# and unchanged by a concurrent `--pool other`.
+gate_procs() {
+    ps -eo args= 2>/dev/null | awk -v pool="$1" '
+        $0 ~ ("^[^ ]*(ba)?sh[ \t]+[^ ]*build-gate\\.sh[ \t]+.*--pool[ \t]+" pool "([ \t]|$)") { n++ }
+        END { print n + 0 }'
+}
+
 if [ ! -e "$out" ]; then
-    printf 'epoch\tiso\tlabel\tload1\tmemavail_kB\ttoolchain_rss_kB\tld\trustc\tcargo\tslots_held\tslots_total\tqueue_depth\tcpu_some\tio_some\tio_full\tmem_some\tdisk_avail_kB\n' > "$out"
+    printf 'epoch\tiso\tlabel\tload1\tmemavail_kB\ttoolchain_rss_kB_min\tld\trustc\tcargo\tslots_held\tslots_total\tgated\tqueue_depth\tungated_ld\tcpu_some\tio_some\tio_full\tmem_some\tdisk_avail_kB\n' > "$out"
 fi
 
 have_fuser=no
 if command -v fuser >/dev/null 2>&1; then
     have_fuser=yes
 else
-    echo "sample-box.sh: WARNING: fuser not found — slots_held will read 0 and" >&2
-    echo "  queue_depth will be meaningless. Install psmisc, or ignore those two" >&2
-    echo "  columns; every other column is unaffected." >&2
+    echo "sample-box.sh: WARNING: fuser not found — slots_held will read 0, so" >&2
+    echo "  queue_depth over-reports (it becomes the gated total) and ungated_ld" >&2
+    echo "  becomes the raw ld count. Install psmisc, or read the 'gated' column" >&2
+    echo "  instead; it needs no fuser. Every other column is unaffected." >&2
 fi
 
 echo "sample-box.sh: sampling every ${interval}s into $out (Ctrl-C to stop)" >&2
@@ -92,6 +136,7 @@ while :; do
     memavail=$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null || echo NA)
     rss=$(toolchain_rss_kb)
     nld=$(count ld); nrustc=$(count rustc); ncargo=$(count cargo)
+    gated=$(gate_procs link)
 
     slots_total=0; slots_held=0
     if [ -d "$pool" ]; then
@@ -106,15 +151,26 @@ while :; do
         done
     fi
 
-    # Linkers beyond the slots they can hold are queued. Approximate: ld and
-    # collect2 nest, so treat this as indicative, not exact.
-    queue=$((nld - slots_held)); [ "$queue" -lt 0 ] && queue=0
+    # Gate processes beyond the slots that are held are waiting for one. This
+    # counts a pre-`ld` waiter, which `nld - slots_held` cannot -- see
+    # gate_procs above. Still not exact: a gate process is counted from the
+    # moment it starts, so one sampled in the microseconds before it takes a
+    # free slot reads as queued for that one sample.
+    queue=$((gated - slots_held)); [ "$queue" -lt 0 ] && queue=0
+
+    # What `nld - slots_held` actually measures: linkers running WITHOUT a slot.
+    # That is not a queue -- it is the degradation ladder being used, e.g.
+    # DAD_LINK_JOBS=0, a missing flock, or the 900s wait budget expiring. Kept
+    # as its own column because it is worth seeing, under a name that says what
+    # it is. `ld`/`collect2` nesting still makes it indicative, not exact.
+    ungated=$((nld - slots_held)); [ "$ungated" -lt 0 ] && ungated=0
 
     disk=$(df -Pk . 2>/dev/null | awk 'NR==2{print $4}' || echo NA)
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$epoch" "$iso" "${label:-none}" "$load1" "$memavail" "$rss" \
-        "$nld" "$nrustc" "$ncargo" "$slots_held" "$slots_total" "$queue" \
+        "$nld" "$nrustc" "$ncargo" "$slots_held" "$slots_total" \
+        "$gated" "$queue" "$ungated" \
         "$(psi cpu some)" "$(psi io some)" "$(psi io full)" "$(psi memory some)" \
         "$disk" >> "$out"
 
