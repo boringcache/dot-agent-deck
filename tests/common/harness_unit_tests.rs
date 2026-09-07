@@ -46,6 +46,7 @@
 //! out.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::common::*;
 
@@ -4102,4 +4103,73 @@ fn the_opencode_env_key_path_is_offered_only_for_an_anthropic_model() {
             "provider match for {model}"
         );
     }
+}
+
+/// Issue #709 / PR #907 review: an UNMEASURABLE load must leave the base
+/// alone, not multiply it by [`MAX_LOAD_FACTOR`].
+///
+/// This is the whole reason `load_factor` is split out of `load_scaled`. On
+/// Linux `machine_load_per_cpu` never returns `None`, so the branch that every
+/// macOS and Windows run takes is unreachable through the public entry point
+/// here — the case has to be driven directly or it is not covered at all,
+/// which is how a 6x-on-every-macOS-run regression sat unnoticed.
+#[test]
+fn unmeasurable_load_leaves_the_base_unscaled() {
+    assert_eq!(
+        load_factor(None),
+        1.0,
+        "a missing measurement is the absence of evidence, not evidence of a \
+         loaded machine: it must not widen the ceiling at all"
+    );
+    // The property the caller actually depends on, through the real entry point.
+    let base = Duration::from_secs(30);
+    assert_eq!(
+        base.mul_f64(load_factor(None)),
+        base,
+        "an unmeasurable load must return the base identically, so a macOS \
+         contributor's 30s wait stays 30s rather than becoming 180s"
+    );
+}
+
+/// A non-finite reading is unmeasurable too, so `load_factor` is total and
+/// cannot hand `Duration::mul_f64` a `NaN` to panic on.
+#[test]
+fn non_finite_load_is_treated_as_unmeasurable() {
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert_eq!(
+            load_factor(Some(bad)),
+            1.0,
+            "{bad} is not a load measurement and must fall back to 1.0"
+        );
+    }
+}
+
+/// The widening #709 exists for is preserved for loads that WERE measured:
+/// clamped below at 1.0 so a quiet box never shrinks a ceiling, and above at
+/// [`MAX_LOAD_FACTOR`] so a runaway average cannot run a hung child into
+/// nextest's own kill window.
+#[test]
+fn measured_load_still_widens_between_one_and_the_cap() {
+    assert_eq!(
+        load_factor(Some(0.1)),
+        1.0,
+        "an idle measured box must never SHRINK a ceiling below its base"
+    );
+    // Issue #709's own measurement: load average 44 on 16 cores.
+    assert_eq!(
+        load_factor(Some(44.0 / 16.0)),
+        2.75,
+        "#709's measured failure must still scale by 2.75, the figure \
+         MAX_LOAD_FACTOR's doc comment records"
+    );
+    assert_eq!(
+        load_factor(Some(1000.0)),
+        MAX_LOAD_FACTOR,
+        "a runaway load average must clamp at the cap"
+    );
+    assert_eq!(
+        load_scaled(Duration::from_secs(8)),
+        Duration::from_secs(8).mul_f64(load_factor(machine_load_per_cpu())),
+        "load_scaled must be exactly load_factor applied to the base"
+    );
 }
