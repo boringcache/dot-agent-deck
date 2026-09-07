@@ -257,6 +257,52 @@ pub enum SpawnShapeOverride {
     Orchestration(Option<String>),
 }
 
+/// The `shape` STRING vocabulary, shared by every door that can set one.
+///
+/// Issue #835 gives `[[scheduled_tasks]]` a `shape` field, so the same three
+/// words now arrive from three places — a hand-edited `schedules.toml`, `schedule
+/// add --shape`, and `schedule update --shape` — and are re-read by the daemon at
+/// fire time. One parser for all four so a value the CLI accepts can never be a
+/// value the loader rejects (or, worse, one the fire silently reinterprets).
+///
+/// Deliberately NOT a `serde` enum on the config field: the stored form has to
+/// round-trip as a plain TOML scalar (`shape = "orchestration:review"`), and the
+/// name half is free-form, so the parse is a string split rather than a variant
+/// match. The field is validated at LOAD (see
+/// [`crate::config::validate_task`]) so a typo is a load error naming the task,
+/// not a surprise on the next cron tick.
+impl SpawnShapeOverride {
+    /// Accepted forms: `single`, `orchestration`, `orchestration:<name>`.
+    ///
+    /// `Err` carries a message that names the offending value AND lists the
+    /// accepted vocabulary, because every caller of this surfaces it to a human
+    /// (a CLI error, a load error, or a fire-failure notification).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        match trimmed {
+            "single" => Ok(Self::SingleAgent),
+            "orchestration" => Ok(Self::Orchestration(None)),
+            other => match other.strip_prefix("orchestration:") {
+                // A named orchestration. The name is NOT validated here — whether
+                // the target dir defines it is a fire-time question against that
+                // dir's config, which can change between authoring and the next
+                // fire. Only the empty name is rejected, since
+                // `orchestration:` reads as a typo for `orchestration` and would
+                // otherwise search for an orchestration literally named "".
+                Some(name) if !name.trim().is_empty() => {
+                    Ok(Self::Orchestration(Some(name.trim().to_string())))
+                }
+                Some(_) => Err(format!(
+                    "invalid shape {raw:?}: `orchestration:` needs a name after the colon (or use bare `orchestration` for the directory's default)"
+                )),
+                None => Err(format!(
+                    "invalid shape {raw:?}: expected `single`, `orchestration`, or `orchestration:<name>`"
+                )),
+            },
+        }
+    }
+}
+
 /// [`decide_target`], with an optional caller override (PRD #220).
 ///
 /// `Err` only for an override naming an orchestration the dir does not define —
@@ -1772,8 +1818,18 @@ async fn confirm_prompt_delivery(
         )
         .await
         {
-            PromptWatch::Confirmed => {
-                log_prompt_confirmed(DELIVERY_LOG_PATH, &pane_id, &delivery_id, attempt);
+            // Issue #685: `confirmation` says which of the matcher's shapes
+            // confirmed this, so a turn that carries the prompt twice is a
+            // distinct line rather than an ordinary success. It changes nothing
+            // about the delivery — every shape returns here.
+            PromptWatch::Confirmed(confirmation) => {
+                log_prompt_confirmed(
+                    DELIVERY_LOG_PATH,
+                    &pane_id,
+                    &delivery_id,
+                    attempt,
+                    confirmation,
+                );
                 return;
             }
             // Issue #424 D5: our prompt came back doubled with no separator, so
@@ -2540,6 +2596,11 @@ pub struct ReuseEntry {
     pub agent_ids: Vec<String>,
     /// The pane reuse re-delivers into (single agent, or orchestrator role).
     pub delivery_pane_id: String,
+    /// Issue #835: what this recorded tab actually IS, so a fire that explicitly
+    /// asks for a different shape does not re-deliver into it. Taken from
+    /// [`SpawnHandle::kind`], so it is the shape that was opened rather than the
+    /// one that was requested.
+    pub kind: SpawnKind,
 }
 
 /// Daemon-owned, in-memory reuse registry keyed by scheduled task `name`
@@ -2572,6 +2633,9 @@ pub struct ExistingTab {
     /// spawned. `None` when the pane is dead OR when a different agent has
     /// inherited the pane id.
     pub live_agent_id: Option<String>,
+    /// Issue #835: the shape this tab was opened with. `None` for a record made
+    /// before the field existed — treated as "unknown", which never blocks reuse.
+    pub kind: Option<SpawnKind>,
 }
 
 /// Reuse-vs-spawn decision (pure, unit-tested).
@@ -2590,7 +2654,23 @@ pub enum ReuseDecision {
 /// recorded tab for the name still has one of its own agents live on its
 /// delivery pane (a stale/closed one, or one whose pane id has been inherited by
 /// an unrelated agent → fresh).
-pub fn decide_reuse(new_tab_per_fire: bool, existing: Option<ExistingTab>) -> ReuseDecision {
+///
+/// `requested` (issue #835) is the shape this fire was TOLD to open, i.e.
+/// `Some` only when the task declares a `shape`. When it disagrees with the tab
+/// on record, the fire spawns fresh instead of re-delivering: the recorded tab
+/// is the wrong shape, and re-delivering into it would reproduce exactly the
+/// surprise the `shape` field exists to remove — a user who discovers their
+/// schedule is firing a team, sets `shape = "single"`, and finds the next fire
+/// still landing in the old orchestrator pane.
+///
+/// `None` (a task with no declared shape) keeps the pre-#835 behaviour exactly:
+/// the shape is derived per fire and never compared, so a config-derived task
+/// reuses its tab as it always did.
+pub fn decide_reuse(
+    new_tab_per_fire: bool,
+    existing: Option<ExistingTab>,
+    requested: Option<&SpawnKind>,
+) -> ReuseDecision {
     if new_tab_per_fire {
         return ReuseDecision::SpawnFresh;
     }
@@ -2598,8 +2678,27 @@ pub fn decide_reuse(new_tab_per_fire: bool, existing: Option<ExistingTab>) -> Re
         Some(ExistingTab {
             pane_id,
             live_agent_id: Some(agent_id),
-        }) => ReuseDecision::Reuse { pane_id, agent_id },
+            kind,
+        }) => {
+            // A recorded tab with no `kind` predates the field; "unknown" never
+            // blocks reuse, so this can only ever spawn fresh on a KNOWN mismatch.
+            if let (Some(want), Some(have)) = (requested, kind.as_ref())
+                && want != have
+            {
+                return ReuseDecision::SpawnFresh;
+            }
+            ReuseDecision::Reuse { pane_id, agent_id }
+        }
         _ => ReuseDecision::SpawnFresh,
+    }
+}
+
+/// The [`SpawnKind`] a resolved target will open — the request side of
+/// [`decide_reuse`]'s comparison (issue #835).
+fn kind_of_target(target: &SpawnTarget) -> SpawnKind {
+    match target {
+        SpawnTarget::SingleAgent { .. } => SpawnKind::SingleAgent,
+        SpawnTarget::Orchestration { name, .. } => SpawnKind::Orchestration { name: name.clone() },
     }
 }
 
@@ -2684,6 +2783,7 @@ pub async fn spawn_or_reuse(
         let map = reuse.lock().unwrap();
         let existing = map.get(&req.task_name).map(|e| ExistingTab {
             pane_id: e.delivery_pane_id.clone(),
+            kind: Some(e.kind.clone()),
             // PRD #127 C3: gate reuse on the liveness of the SPECIFIC pane the
             // prompt is delivered into (orchestrator role / single-agent pane),
             // NOT "any agent for the task" — otherwise we'd re-deliver into a
@@ -2707,7 +2807,11 @@ pub async fn spawn_or_reuse(
                 .pane_current_agent_id(&e.delivery_pane_id)
                 .filter(|live| e.agent_ids.iter().any(|recorded| recorded == live)),
         });
-        decide_reuse(new_tab_per_fire, existing)
+        decide_reuse(
+            new_tab_per_fire,
+            existing,
+            req.resolved_target.as_ref().map(kind_of_target).as_ref(),
+        )
     };
 
     match decision {
@@ -2727,6 +2831,8 @@ pub async fn spawn_or_reuse(
                 let entry = ReuseEntry {
                     agent_ids: handle.agents.iter().map(|a| a.id.clone()).collect(),
                     delivery_pane_id: handle.delivery_pane_id.clone(),
+                    // What was actually opened, not what was asked for.
+                    kind: handle.kind.clone(),
                 };
                 reuse.lock().unwrap().insert(task_name, entry);
             }
@@ -4389,10 +4495,23 @@ mod tests {
             GuardedSend::Applied,
             "attempt 1 must never be refused before an automatic write timestamp exists"
         );
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        let after_initial_delivery = replacement_registry
-            .snapshot(&replacement_agent)
-            .expect("initial detached delivery snapshot");
+        // Wait for attempt 1's own echo rather than betting a fixed 75 ms sleep
+        // beats the PTY round trip (issue #851). The precondition below is the
+        // same condition, and it is the one a contended `build-windows` runner
+        // lost: the fast tier has `retries = 0` and no override covers this
+        // test, so one lost bet hard-reds a REQUIRED check on a precondition
+        // rather than on the property under test. This wait is keyed on content
+        // and bounded only by a diagnostic deadline, so load makes it slower
+        // instead of wrong. Nothing precedes attempt 1 on this pane, so there is
+        // no earlier `/bin/cat` copy that could cut into its echo and no drain
+        // to do first; the `type_user_draft` below owns that half for the write
+        // that follows.
+        let after_initial_delivery = wait_for_detached_payload_echo(
+            &replacement_registry,
+            &replacement_agent,
+            REPLACEMENT_PROMPT,
+        )
+        .await;
         assert!(
             after_initial_delivery
                 .windows(REPLACEMENT_PROMPT.len())
@@ -4522,6 +4641,18 @@ mod tests {
                 .expect("initial guarded delivery"),
             GuardedSend::Applied
         );
+        // Drain the initial delivery before the user's draft is written — the
+        // same "drain, then write" discipline `type_user_bytes` applies for the
+        // fixtures that can use it. This one writes through the writer it is
+        // deliberately holding, so it owns both halves itself. That delivery put
+        // one input line in flight (its payload and submit CR), and the byte
+        // target and the line discipline's echo are two independent writers into
+        // one PTY output queue: measured on Unix under #850, a `/bin/cat` copy
+        // still pending can land in the MIDDLE of the draft's echo, an
+        // append-only split that no amount of waiting reassembles. It also keeps
+        // that copy out of the exact-equality window at the end of this test,
+        // where a byte arriving late reads as bytes the refused retry sent.
+        wait_for_drained_lines(&registry, &agent_id, 1).await;
 
         let handle = registry
             .subscribe(&agent_id)
@@ -4547,7 +4678,13 @@ mod tests {
         user_writer
             .flush()
             .expect("flush unsent attached user draft");
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        // The draft's own echo, not a fixed 75 ms sleep, is what proves the
+        // user's bytes are physically visible before the clock stamp (issue
+        // #851) — the precondition below is that same condition, and it is what
+        // a contended runner failed. No quiescence wait is needed on top of it:
+        // the draft carries no line terminator, so it completes no input line
+        // and `/bin/cat` has nothing to copy back.
+        wait_for_echo_bytes(&registry, &agent_id, USER_DRAFT.as_bytes()).await;
         let before_writer_release = registry.snapshot(&agent_id).expect("pre-release snapshot");
         assert!(
             before_writer_release
@@ -5092,6 +5229,117 @@ mod tests {
 
     fn parse_config(toml: &str) -> ProjectConfig {
         toml::from_str(toml).expect("parse project config")
+    }
+
+    // Issue #835 — the `shape` STRING vocabulary. One parser serves the config
+    // loader, both CLI write doors and the daemon's fire-time resolve, so these
+    // cases pin what every one of them accepts.
+    #[test]
+    fn shape_parse_accepts_the_three_documented_forms() {
+        assert_eq!(
+            SpawnShapeOverride::parse("single").unwrap(),
+            SpawnShapeOverride::SingleAgent
+        );
+        assert_eq!(
+            SpawnShapeOverride::parse("orchestration").unwrap(),
+            SpawnShapeOverride::Orchestration(None)
+        );
+        assert_eq!(
+            SpawnShapeOverride::parse("orchestration:review").unwrap(),
+            SpawnShapeOverride::Orchestration(Some("review".to_string()))
+        );
+    }
+
+    // Surrounding whitespace is tolerated on both the value and the name, since
+    // it arrives from hand-edited TOML and a shell quoting a `--shape` argument.
+    #[test]
+    fn shape_parse_trims_surrounding_whitespace() {
+        assert_eq!(
+            SpawnShapeOverride::parse("  single  ").unwrap(),
+            SpawnShapeOverride::SingleAgent
+        );
+        assert_eq!(
+            SpawnShapeOverride::parse("orchestration:  review ").unwrap(),
+            SpawnShapeOverride::Orchestration(Some("review".to_string()))
+        );
+    }
+
+    // Anything else is an ERROR, never a silent "use the default" — the whole
+    // point of the field is that a shape the author wrote is the shape that
+    // fires. The message names the offending value and lists the vocabulary,
+    // because all three callers surface it to a human.
+    #[test]
+    fn shape_parse_rejects_everything_else() {
+        for bad in [
+            "",
+            "   ",
+            "Single",
+            "SINGLE",
+            "team",
+            "orchestration:",
+            "orchestration:   ",
+            "orchestrations",
+            "orchestration review",
+            "dispatcher",
+        ] {
+            let err = match SpawnShapeOverride::parse(bad) {
+                Ok(v) => panic!("shape {bad:?} must be rejected, got {v:?}"),
+                Err(e) => e,
+            };
+            assert!(
+                err.contains("shape"),
+                "error for {bad:?} must name the field, got {err:?}"
+            );
+            assert!(
+                err.contains("single") || err.contains("name after the colon"),
+                "error for {bad:?} must state what IS accepted, got {err:?}"
+            );
+            // These messages are printed straight to a terminal by `schedule
+            // add`/`update` and into the daemon log by a failed fire. A `\`
+            // line-continuation in the literal survived `cargo fmt` as a run of
+            // real spaces once already, so pin the rendered shape rather than
+            // trusting the source to keep its own indentation out of the string.
+            // Checked only for inputs that carry no run of spaces themselves —
+            // the message echoes the offending value, so `"   "` would otherwise
+            // fail on the user's own text rather than on the literal.
+            if !bad.contains("  ") {
+                assert!(
+                    !err.contains("  "),
+                    "error for {bad:?} must not carry source indentation, got {err:?}"
+                );
+            }
+        }
+    }
+
+    // A parsed shape drives the SAME resolver `dispatch` uses, so the end-to-end
+    // property the scheduler relies on is: `single` beats a dir that defines
+    // orchestrations, rather than merely parsing.
+    #[test]
+    fn shape_parse_single_then_resolve_beats_a_dir_defining_orchestrations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"team\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+        )
+        .expect("write config");
+        let cfg = load_config_for_dir(dir.path());
+        assert!(
+            matches!(
+                decide_target(cfg.as_ref(), dir.path(), Some("mycmd")),
+                SpawnTarget::Orchestration { .. }
+            ),
+            "precondition: with no shape this dir derives an orchestration"
+        );
+        let over = SpawnShapeOverride::parse("single").expect("parse single");
+        assert_eq!(
+            decide_target_with_override(cfg.as_ref(), dir.path(), Some("mycmd"), Some(&over))
+                .expect("single always resolves"),
+            SpawnTarget::SingleAgent {
+                command: Some("mycmd".to_string())
+            },
+            "`single` must win over the dir's orchestrations AND carry the command"
+        );
     }
 
     #[test]
@@ -5703,8 +5951,12 @@ mod tests {
         let existing = Some(ExistingTab {
             pane_id: "p1".into(),
             live_agent_id: Some("agent-1".into()),
+            kind: None,
         });
-        assert_eq!(decide_reuse(true, existing), ReuseDecision::SpawnFresh);
+        assert_eq!(
+            decide_reuse(true, existing, None),
+            ReuseDecision::SpawnFresh
+        );
     }
 
     #[test]
@@ -5712,9 +5964,10 @@ mod tests {
         let existing = Some(ExistingTab {
             pane_id: "p1".into(),
             live_agent_id: Some("agent-1".into()),
+            kind: None,
         });
         assert_eq!(
-            decide_reuse(false, existing),
+            decide_reuse(false, existing, None),
             ReuseDecision::Reuse {
                 pane_id: "p1".into(),
                 agent_id: "agent-1".into(),
@@ -5724,12 +5977,134 @@ mod tests {
 
     #[test]
     fn decide_reuse_spawns_fresh_when_no_entry_or_stale() {
-        assert_eq!(decide_reuse(false, None), ReuseDecision::SpawnFresh);
+        assert_eq!(decide_reuse(false, None, None), ReuseDecision::SpawnFresh);
         let stale = Some(ExistingTab {
             pane_id: "p1".into(),
             live_agent_id: None,
+            kind: None,
         });
-        assert_eq!(decide_reuse(false, stale), ReuseDecision::SpawnFresh);
+        assert_eq!(decide_reuse(false, stale, None), ReuseDecision::SpawnFresh);
+    }
+
+    // Issue #835 — a fire that explicitly asks for a shape must NOT re-deliver
+    // into a live tab of a different shape. This is the upgrade path a user
+    // actually takes: the schedule has been firing a team, they set
+    // `shape = "single"`, and without this the next fire lands right back in the
+    // old orchestrator pane — the very surprise the field exists to remove.
+    #[test]
+    fn decide_reuse_spawns_fresh_when_the_requested_shape_differs() {
+        let team = || {
+            Some(ExistingTab {
+                pane_id: "p1".into(),
+                live_agent_id: Some("agent-1".into()),
+                kind: Some(SpawnKind::Orchestration {
+                    name: "team".into(),
+                }),
+            })
+        };
+        // live orchestration tab, but this fire wants one agent
+        assert_eq!(
+            decide_reuse(false, team(), Some(&SpawnKind::SingleAgent)),
+            ReuseDecision::SpawnFresh
+        );
+        // live orchestration tab, but this fire wants a DIFFERENT orchestration
+        assert_eq!(
+            decide_reuse(
+                false,
+                team(),
+                Some(&SpawnKind::Orchestration {
+                    name: "other".into()
+                })
+            ),
+            ReuseDecision::SpawnFresh
+        );
+    }
+
+    // The matching half: an explicit shape that AGREES with the recorded tab
+    // reuses it, so declaring a shape does not silently disable tab reuse.
+    #[test]
+    fn decide_reuse_reuses_when_the_requested_shape_matches() {
+        let single = Some(ExistingTab {
+            pane_id: "p1".into(),
+            live_agent_id: Some("agent-1".into()),
+            kind: Some(SpawnKind::SingleAgent),
+        });
+        assert_eq!(
+            decide_reuse(false, single, Some(&SpawnKind::SingleAgent)),
+            ReuseDecision::Reuse {
+                pane_id: "p1".into(),
+                agent_id: "agent-1".into(),
+            }
+        );
+        let team = Some(ExistingTab {
+            pane_id: "p2".into(),
+            live_agent_id: Some("agent-1".into()),
+            kind: Some(SpawnKind::Orchestration {
+                name: "team".into(),
+            }),
+        });
+        assert_eq!(
+            decide_reuse(
+                false,
+                team,
+                Some(&SpawnKind::Orchestration {
+                    name: "team".into()
+                })
+            ),
+            ReuseDecision::Reuse {
+                pane_id: "p2".into(),
+                agent_id: "agent-1".into(),
+            }
+        );
+    }
+
+    // A task with NO declared shape is untouched: the shape is derived per fire
+    // and never compared, so a config-derived task reuses its tab exactly as it
+    // did before #835 — even when the recorded kind is known.
+    #[test]
+    fn decide_reuse_ignores_kind_when_no_shape_was_requested() {
+        let team = Some(ExistingTab {
+            pane_id: "p1".into(),
+            live_agent_id: Some("agent-1".into()),
+            kind: Some(SpawnKind::Orchestration {
+                name: "team".into(),
+            }),
+        });
+        assert_eq!(
+            decide_reuse(false, team, None),
+            ReuseDecision::Reuse {
+                pane_id: "p1".into(),
+                agent_id: "agent-1".into(),
+            }
+        );
+    }
+
+    // `kind_of_target` is the request side of that comparison: it must read the
+    // TARGET's shape, including the orchestration's resolved name, so a rename
+    // in the config counts as a different shape.
+    #[test]
+    fn kind_of_target_reads_the_targets_shape() {
+        assert_eq!(
+            kind_of_target(&SpawnTarget::SingleAgent {
+                command: Some("cat".into())
+            }),
+            SpawnKind::SingleAgent
+        );
+        let orch = crate::project_config::OrchestrationConfig {
+            name: "team".to_string(),
+            default: false,
+            roles: Vec::new(),
+        };
+        assert_eq!(
+            kind_of_target(&SpawnTarget::Orchestration {
+                name: "team".into(),
+                roles: Vec::new(),
+                config: Box::new(orch),
+            }),
+            SpawnKind::Orchestration {
+                name: "team".into()
+            }
+        );
     }
 
     /// Issue #617 (finding 2): a recorded tab whose delivery pane is live but
@@ -5743,8 +6118,15 @@ mod tests {
         let inherited = Some(ExistingTab {
             pane_id: "p1".into(),
             live_agent_id: None,
+            // Issue #835's shape gate is not what refuses this one: the kind
+            // matches what the fire asks for, so the refusal below is the
+            // identity gate and nothing else.
+            kind: Some(SpawnKind::SingleAgent),
         });
-        assert_eq!(decide_reuse(false, inherited), ReuseDecision::SpawnFresh);
+        assert_eq!(
+            decide_reuse(false, inherited, Some(&SpawnKind::SingleAgent)),
+            ReuseDecision::SpawnFresh
+        );
     }
 
     // --- Phase 2B deliver-on-idle decision (M2.2 / Q6) ---
