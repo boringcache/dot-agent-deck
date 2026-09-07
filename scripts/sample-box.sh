@@ -111,8 +111,25 @@ gate_procs() {
         END { print n + 0 }'
 }
 
-if [ ! -e "$out" ]; then
-    printf 'epoch\tiso\tlabel\tload1\tmemavail_kB\ttoolchain_rss_kB_min\tld\trustc\tcargo\tslots_held\tslots_total\tgated\tqueue_depth\tungated_ld\tcpu_some\tio_some\tio_full\tmem_some\tdisk_avail_kB\n' > "$out"
+header='epoch	iso	label	load1	memavail_kB	toolchain_rss_kB_min	ld	rustc	cargo	slots_held	slots_total	gated	queue_depth	ungated_ld	cpu_some	io_some	io_full	mem_some	disk_avail_kB'
+
+# APPENDING UNDER A DIFFERENT HEADER WOULD SILENTLY MISATTRIBUTE EVERY COLUMN,
+# so refuse instead. This is not hypothetical caution: the column set has
+# already changed once (queue_depth's meaning, and two columns added), and a
+# resumed run pointed at a file from before that change would line 19 values up
+# under 17 names and read as plausible data. Refusing costs one flag; a
+# mis-columned sample is a wrong number presented as a right one, which is the
+# whole thing this protocol exists to prevent.
+if [ -e "$out" ]; then
+    existing=$(head -n 1 "$out" 2>/dev/null)
+    if [ "$existing" != "$(printf '%b' "$header")" ]; then
+        echo "sample-box.sh: $out already exists with a DIFFERENT header." >&2
+        echo "  Appending would put these columns under the wrong names." >&2
+        echo "  Use a fresh --out, or move the old file aside." >&2
+        exit 2
+    fi
+else
+    printf '%b\n' "$header" > "$out"
 fi
 
 have_fuser=no
