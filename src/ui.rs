@@ -625,10 +625,11 @@ Collect these fields:
 - prompt: the prompt text to deliver on each fire.
 - new_tab_per_fire: true to open a fresh tab every fire, false (default) to reuse one tab.
 - enabled: true (default) or false.
+- shape: OPTIONAL. Omit it and the fire's shape comes from working_dir's config — which means a working_dir defining [[orchestrations]] fires the WHOLE TEAM and ignores `command`. Pass \"single\" to force ONE agent running `command` in that directory anyway (the usual want when the schedule drives a project skill and just needs the repo as its cwd), \"orchestration\" for that directory's default team, or \"orchestration:<name>\" for a named one. ASK when working_dir defines orchestrations and the user described a single-agent job.
 
 Rules:
 - NEVER edit the TOML file directly. ALWAYS write via the validated CLI, which checks the cron, expands paths, and writes the global config atomically:
-  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>]
+  dot-agent-deck schedule add --name <name> --cron <cron> --working-dir <dir> --command <cmd> --prompt <text> [--new-tab-per-fire <true|false>] [--enabled <true|false>] [--shape <single|orchestration|orchestration:NAME>]
 - The user can TEST the prompt in THIS session before committing — offer to run it now and show them the result (\"run it now, show me\").
 - CONFIRM the full entry (every field) with the user before you call `schedule add`.
 - AFTER `schedule add` succeeds, tell the user this authoring pane existed ONLY to create the schedule and can be closed now — when the schedule fires, a single-agent run surfaces live in its own pane on the deck, while an orchestration-targeted run appears in its tab when the deck is (re)opened.";
@@ -814,6 +815,7 @@ fn build_schedule_authoring_mode(
                  - prompt: {prompt}\n\
                  - new_tab_per_fire: {ntpf}\n\
                  - enabled: {enabled}\n\
+                 - shape: {shape}\n\
                  Start from these values and write changes with \
                  `dot-agent-deck schedule update --name {name} ...` (NOT `add`). \
                  RENAME IS FORBIDDEN — the name {name:?} is fixed (it is the reuse-tab key); \
@@ -828,6 +830,14 @@ fn build_schedule_authoring_mode(
                 prompt = t.prompt,
                 ntpf = t.new_tab_per_fire,
                 enabled = t.enabled,
+                // Issue #835: spelled out rather than blank when unset — the
+                // absence is the surprising state (a config-derived fire in a
+                // repo with `[[orchestrations]]` ignores `command`), so an
+                // editing agent has to be able to see it and offer `--shape`.
+                shape = t
+                    .shape
+                    .as_deref()
+                    .unwrap_or("(unset — derived from working_dir's config)"),
             )
         }
     };
@@ -5698,6 +5708,14 @@ pub enum Action {
     /// writer + daemon reload). Definition-only: it must NOT close an open tab
     /// for that schedule (the main-loop handler does no agent teardown).
     ScheduleDelete(String),
+    /// Issue #914: the manager dialog's `t` action — flip the named schedule's
+    /// `enabled` flag (rewrite `schedules.toml` via the validated writer +
+    /// daemon reload), pausing or resuming it without discarding the definition.
+    ///
+    /// Deliberately NOT two-step like [`Action::ScheduleDelete`]: delete destroys
+    /// the definition, so it earns a confirm; this is reversible by pressing the
+    /// same key again, and a prompt there is friction for nothing.
+    ScheduleToggleEnabled(String),
 }
 
 /// Kitty/xterm modifier parameter for a CSI sequence: `1 + bitmask`, where
@@ -8022,6 +8040,16 @@ fn handle_scheduled_tasks_key(key: KeyEvent, ui: &mut UiState) -> Action {
         KeyCode::Char('r') => {
             if let Some(task) = ui.scheduled_tasks.get(ui.scheduled_selected) {
                 return Action::ScheduleRunNow(task.name.clone());
+            }
+            Action::Continue
+        }
+        // Issue #914: pause/resume the selected schedule. The dialog already
+        // RENDERS `disabled`; until this key existed there was no way to reach
+        // that state from the deck, so the one management action with no button
+        // was the one you need when a schedule is misbehaving.
+        KeyCode::Char('t') => {
+            if let Some(task) = ui.scheduled_tasks.get(ui.scheduled_selected) {
+                return Action::ScheduleToggleEnabled(task.name.clone());
             }
             Action::Continue
         }
@@ -11001,6 +11029,49 @@ fn dispatch_action(
                 if ui.scheduled_selected >= ui.scheduled_tasks.len() {
                     ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
                 }
+            }
+        }
+        Action::ScheduleToggleEnabled(name) => {
+            // Issue #914: pause/resume — flip `enabled` through the same
+            // validated writer every other door uses, then tell the running
+            // daemon so the change lands on the NEXT fire rather than on the
+            // next daemon start. Definition-preserving by construction: unlike
+            // delete, nothing is removed, so an open tab and the task's prompt,
+            // cron and working dir all survive.
+            let mut loaded = config::LoadedSchedules::load();
+            let want_enabled = !loaded
+                .tasks
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.enabled)
+                .unwrap_or(true);
+            match crate::schedule_cli::set_enabled(&mut loaded.tasks, &name, want_enabled) {
+                Ok(()) => {
+                    let path = config::schedules_path();
+                    if let Err(e) = crate::schedule_cli::write_atomic(&path, &loaded.tasks) {
+                        ui.status_message =
+                            Some((format!("Toggle failed: {e}"), std::time::Instant::now()));
+                    } else {
+                        let _ = send_daemon_request_blocking(
+                            &crate::daemon_protocol::AttachRequest::ReloadSchedules,
+                        );
+                        let verb = if want_enabled { "Enabled" } else { "Paused" };
+                        ui.status_message = Some((
+                            format!("{verb} schedule '{name}'"),
+                            std::time::Instant::now(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    ui.status_message =
+                        Some((format!("Toggle failed: {e}"), std::time::Instant::now()));
+                }
+            }
+            // Dialog stays open, like run-now and delete: refresh the rows so the
+            // status cell and next-fire column show the new state immediately.
+            if ui.mode == UiMode::ScheduledTasks {
+                ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
+                ui.scheduled_live_names = live_schedule_names();
             }
         }
         Action::Continue => {}
@@ -18749,7 +18820,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
     // the inner width, so they don't drive it — the list columns, the header,
     // the confirmation, the action-button row, the title, and the empty-state
     // message do. (`[Add a] [Edit e] [Delete d] [Run now r]`, indented one cell.)
-    const BUTTON_ROW_W: usize = 1 + 7 + 1 + 8 + 1 + 10 + 1 + 11;
+    const BUTTON_ROW_W: usize = 1 + 7 + 1 + 8 + 1 + 10 + 1 + 11 + 1 + 10;
     let list_w = 2 + name_col + status_col + next_col;
     // R-Sug1: the header line appends a scroll indicator (e.g. `  (↑12 ↓34)`)
     // when rows are hidden. Reserve its worst-case width in the header budget so
@@ -18917,6 +18988,15 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         .get(ui.scheduled_selected)
         .map(|t| Action::ScheduleRunNow(t.name.clone()))
         .unwrap_or(Action::Continue);
+    // Issue #914: pause/resume the selected row. A FIXED label rather than a
+    // `Pause`/`Resume` that tracks the row's state — `BUTTON_ROW_W` above is a
+    // compile-time budget with a `debug_assert_eq!` drift guard, and a label
+    // whose width varies with the selection would defeat it.
+    let toggle_action = ui
+        .scheduled_tasks
+        .get(ui.scheduled_selected)
+        .map(|t| Action::ScheduleToggleEnabled(t.name.clone()))
+        .unwrap_or(Action::Continue);
     // PRD #127: each button advertises its shortcut key alongside the label —
     // `[Add a]` / `[Edit e]` / `[Delete d]` / `[Run now r]` — mirroring the
     // `[Scheduled Tasks s]` button-bar button so a keyboard user can tell which
@@ -18928,6 +19008,7 @@ fn render_scheduled_tasks(frame: &mut Frame, ui: &UiState) -> ScheduledTasksClic
         Button::new("Edit", "e", Action::ScheduleEdit, has_rows),
         Button::new("Delete", "d", Action::ScheduleArmDelete, has_rows),
         Button::new("Run now", "r", run_now_action, has_rows),
+        Button::new("Toggle", "t", toggle_action, has_rows),
     ];
     // R-Nit1: `BUTTON_ROW_W` (used above to budget the modal width before the
     // buttons exist) must equal the actual rendered button-row width — indent
@@ -22427,6 +22508,7 @@ pub fn render_new_pane_form_schedule_to_buffer(
         prompt: "digest prompt".to_string(),
         new_tab_per_fire: false,
         enabled: true,
+        shape: None,
         issue_dispatch: None,
     });
     let form = NewPaneFormState::new_schedule_locked(
@@ -31831,6 +31913,7 @@ mod tests {
             prompt: format!("{name}-prompt-marker"),
             new_tab_per_fire: false,
             enabled,
+            shape: None,
             issue_dispatch: None,
         }
     }
