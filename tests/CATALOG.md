@@ -1724,6 +1724,22 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the rendered card label (the `AgentRecord`→placeholder→render mapping is covered by `rehydration` + L1 dashboard tests); the live-stream upgrade path while a TUI is already attached.
 - **Platform coverage:** mac+linux.
 
+#### hooks/ingest
+
+##### hooks/ingest/001 — An over-long hook line is refused at the production cap rather than buffered, and the daemon keeps serving (issues #903 / #319).
+- **Layer:** L1 (the real `run_hook_loop` driven against a real Unix hook socket in-process; no PTY, no deck binary, no agent).
+- **Agent:** none (three synthetic `session_start` lines differing only in length).
+- **Asserts:** a line of exactly `bounded_read::MAX_HOOK_LINE_BYTES` produces a card — the cap is inclusive, so no legitimate producer is truncated — while a line **one byte** longer produces none; and an ordinary event written on a *later* connection lands, which is the happens-after fact that makes the over-cap line's absence "refused" rather than "not yet". Before the fix `next_line()` grew its buffer until the newline arrived, so the over-cap line was applied like any other and an arbitrarily large one would have been buffered whole.
+- **Does not assert:** the `tracing::warn!` wording on the refusal (a best-effort logging path, and deliberately naming byte counts rather than the producer — see `MAX_CONCURRENT_HOOK_CONNECTIONS`); that the refusal happens before `serde_json` is reached — that is structural (the read returns an error, so nothing is handed to the parser) rather than observable from here; the reader's boundary semantics in detail (EOF, CRLF, non-UTF-8, successive lines), which the `read_capped_line` unit tests in `src/bounded_read.rs` cover with small caps; the writer's own outcome, which may legitimately fail partway once the daemon stops reading.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### hooks/ingest/002 — Concurrent hook connections are capped, and an event behind the cap is delayed rather than dropped (issue #319).
+- **Layer:** L1 (the real `run_hook_loop` driven against a real Unix hook socket in-process; no PTY, no deck binary, no agent).
+- **Agent:** none (`MAX_CONCURRENT_HOOK_CONNECTIONS` + 1 synthetic `session_start` lines, one per connection).
+- **Asserts:** filling every slot with a connection that first lands an event (proof it was accepted) and then stays open holds the daemon at its cap; a further connection's event is **not** applied while the cap holds; and closing one held connection makes that same event arrive — so the bound is backpressure, not admission control, and nothing is lost. Before the fix every accepted connection got its own unbounded `tokio::spawn`.
+- **Does not assert:** how long a connection may hold its slot — there is no read timeout on this socket, deliberately (the two issues ask for the allocation bounds; bounding availability needs #318's provenance work to know which producer to blame); the saturation `warn!`; that the kernel's listen backlog is large enough for any particular burst.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Notify, broadcast};
 use tracing::{debug, error, info, warn};
 
@@ -1849,6 +1849,112 @@ async fn run_shell_activity_monitor_with<S, F>(
     }
 }
 
+/// Issue #319: how many hook-socket connections the daemon serves at once.
+///
+/// **Where the number comes from.** A hook connection is short-lived by
+/// construction — the bundled `hook` subcommand connects, writes one JSON line
+/// and exits — so legitimate concurrency is set by how many producers can be
+/// mid-send at the same instant, not by how many panes exist. The longest-held
+/// connections are the reply-bearing verbs, and the slowest of those is
+/// `dispatch`, which creates a git worktree and spawns an agent inside the
+/// connection task. This repository's largest orchestration defines 6 roles, so
+/// 32 is over five times the widest single unit it can start, and a hook event
+/// queued behind them is *delayed* rather than discarded by the daemon (see
+/// [`accept_hook_connection`] for what the one residual loss case is).
+///
+/// It is also the second factor in the daemon's worst-case hook-ingest
+/// footprint: 32 connections x
+/// [`MAX_HOOK_LINE_BYTES`](crate::bounded_read::MAX_HOOK_LINE_BYTES) is 256 MiB
+/// of line buffer, against no bound at all before this. That product is the
+/// reason the line cap sits below the attach socket's `MAX_FRAME_LEN` rather
+/// than matching it.
+///
+/// What the cap does NOT bound is how long one connection may hold its slot:
+/// there is no read timeout on this socket, so a peer that connects and never
+/// writes holds a permit until it goes away. That is a deliberate scope line —
+/// #903 and #319 ask for the two allocation bounds, and a same-uid producer
+/// that wants to make the daemon unavailable has cheaper ways (it can signal the
+/// daemon's process directly). Bounding *availability* needs an idle timeout and
+/// belongs with #318's provenance work, which is where "which producer is doing
+/// this?" becomes answerable at all.
+pub const MAX_CONCURRENT_HOOK_CONNECTIONS: usize = 32;
+
+/// Wait for a free connection slot, then accept one hook connection.
+///
+/// The permit is taken **before** `accept`, which is what makes this
+/// backpressure rather than admission control: at the cap the daemon simply
+/// stops accepting, and the next producer's connection waits in the kernel's
+/// listen backlog until a slot frees. The daemon itself therefore discards
+/// nothing, and — because a hook send is a `connect`, a small write and an
+/// exit — the producer does not even block: its line sits in the socket buffer
+/// and is read when the daemon gets to it. Rejecting the connection instead
+/// would have been simpler and would have thrown away a legitimate event every
+/// time a burst outran the cap.
+///
+/// The one loss case left is a burst deep enough to fill the *listen backlog*
+/// as well, where `connect` fails at the producer. That is a better place for
+/// it to surface than here: the producer gets an error it can report or retry,
+/// rather than a write that appears to succeed into a daemon that will never
+/// read it.
+///
+/// Cancellation-safe for the `tokio::select!` it is polled in: dropping this
+/// future releases the permit, whether it was cancelled waiting for a slot or
+/// waiting for a connection.
+///
+/// `at_cap` is the caller's latch, so the saturation warning fires on the
+/// transition into saturation instead of once per waiting connection.
+async fn accept_hook_connection(
+    listener: &IpcListener,
+    conn_limit: &Arc<tokio::sync::Semaphore>,
+    at_cap: &mut bool,
+) -> io::Result<(tokio::sync::OwnedSemaphorePermit, IpcStream)> {
+    let permit = match Arc::clone(conn_limit).try_acquire_owned() {
+        Ok(permit) => {
+            *at_cap = false;
+            permit
+        }
+        Err(_) => {
+            if !*at_cap {
+                *at_cap = true;
+                warn!(
+                    limit = MAX_CONCURRENT_HOOK_CONNECTIONS,
+                    "hook socket at its concurrent-connection cap; further connections wait in \
+                     the listen backlog until a slot frees — events are delayed, not dropped"
+                );
+            }
+            // Unreachable in practice: the semaphore is owned by the loop and
+            // never closed, so `acquire_owned` can only fail after a `close()`
+            // nothing calls. Surfaced as an error rather than unwrapped so a
+            // future close ends the loop instead of panicking it.
+            Arc::clone(conn_limit)
+                .acquire_owned()
+                .await
+                .map_err(io::Error::other)?
+        }
+    };
+    let stream = listener.accept().await?;
+    Ok((permit, stream))
+}
+
+/// How much of a rejected hook line reaches the log. See the call site in
+/// [`run_hook_loop`] for why this is clamped at all.
+const MALFORMED_LOG_PREFIX_BYTES: usize = 512;
+
+/// Clamp a producer-supplied line to [`MALFORMED_LOG_PREFIX_BYTES`] for
+/// logging, marking the cut so a truncated line is never mistaken for the whole
+/// payload. Cuts on a char boundary, because the line is arbitrary UTF-8 and
+/// slicing mid-character would panic.
+fn clamp_for_log(line: &str) -> std::borrow::Cow<'_, str> {
+    if line.len() <= MALFORMED_LOG_PREFIX_BYTES {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let end = (0..=MALFORMED_LOG_PREFIX_BYTES)
+        .rev()
+        .find(|&i| line.is_char_boundary(i))
+        .unwrap_or(0);
+    std::borrow::Cow::Owned(format!("{}…<truncated>", &line[..end]))
+}
+
 async fn run_hook_loop(
     listener: IpcListener,
     state: SharedState,
@@ -1857,6 +1963,15 @@ async fn run_hook_loop(
     shutdown: Arc<Notify>,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
 ) -> Result<(), DaemonError> {
+    // Issue #319: bound how many hook connections are being served at once.
+    // Every accepted connection used to get its own `tokio::spawn` with nothing
+    // capping how many could be outstanding, so a producer that opened
+    // connections faster than they finished grew the daemon's task set and its
+    // per-connection buffers without limit.
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOOK_CONNECTIONS));
+    // Whether the cap is currently holding, so the warning below fires on the
+    // transition into saturation rather than once per waiting connection.
+    let mut at_cap = false;
     loop {
         tokio::select! {
             // PRD #93 M1.2: a notified shutdown wins over a fresh `accept` —
@@ -1873,22 +1988,91 @@ async fn run_hook_loop(
                 info!("Daemon hook loop exiting on shutdown signal");
                 return Ok(());
             }
-            accept_res = listener.accept() => match accept_res {
-            Ok(stream) => {
+            accept_res = accept_hook_connection(&listener, &conn_limit, &mut at_cap) => match accept_res {
+            Ok((permit, stream)) => {
                 let state = state.clone();
                 let event_tx = event_tx.clone();
                 let pty_registry = pty_registry.clone();
                 let worktree_registry = worktree_registry.clone();
                 tokio::spawn(async move {
+                    // Issue #319: the permit rides INTO the task and is dropped
+                    // when it returns, so "connections being served" is exactly
+                    // what the semaphore counts. Holding it in the loop above
+                    // instead would bound accepts rather than tasks, which is
+                    // not the thing that grows.
+                    let _permit = permit;
                     // PRD #201: split so the read-only `get-seed` verb can write
                     // a reply back on the same connection. Every other message
                     // on this socket is fire-and-forget, so the write half is
                     // only ever used by the `GetSeed` arm below.
                     let (read_half, mut write_half) = tokio::io::split(stream);
-                    let reader = tokio::io::BufReader::new(read_half);
-                    let mut lines = reader.lines();
+                    let mut reader = tokio::io::BufReader::new(read_half);
 
-                    while let Ok(Some(line)) = lines.next_line().await {
+                    // Issue #903 (duplicate #319): this used to be
+                    // `reader.lines()` driven by `next_line()`, which grows its
+                    // buffer until a newline arrives or the peer goes away — so
+                    // a same-uid producer could make the daemon allocate an
+                    // arbitrarily large `String` (and then `serde_json` allocate
+                    // the parsed fields on top of it) BEFORE any admission
+                    // control decided whether the event was even for a pane this
+                    // daemon owns. `read_capped_line` resolves the same three
+                    // outcomes under a ceiling; see `MAX_HOOK_LINE_BYTES` for
+                    // where the number comes from.
+                    loop {
+                        let line = match crate::bounded_read::read_capped_line(
+                            &mut reader,
+                            crate::bounded_read::MAX_HOOK_LINE_BYTES,
+                        )
+                        .await
+                        {
+                            Ok(Some(line)) => line,
+                            // Peer closed — the ordinary end of every
+                            // fire-and-forget send.
+                            Ok(None) => break,
+                            Err(crate::bounded_read::CappedLineError::TooLong {
+                                limit,
+                                line_bytes,
+                            }) => {
+                                // Refused, not truncated, and never silently: a
+                                // prefix of a JSON object can parse, so applying
+                                // one would mean acting on a half-populated
+                                // event. The connection goes because the peer is
+                                // mid-message and there is no resynchronisation
+                                // point — the next byte it sends is still part of
+                                // a message we have already declined.
+                                //
+                                // The producer is deliberately NOT named. #903's
+                                // suggested shape was to name "the peer's pane
+                                // id", but the pane id lives in the payload that
+                                // was just refused; the only identity available
+                                // here is the peer's OS credentials, and binding
+                                // hook-event provenance is #318's surface, not
+                                // this one. Byte counts, never bytes: the
+                                // content is attacker-controlled and a log is
+                                // the wrong place to reproduce it.
+                                warn!(
+                                    limit_bytes = limit,
+                                    line_bytes,
+                                    "hook socket: refused an over-long line and dropped the \
+                                     connection — a producer sent this many bytes with no \
+                                     newline, so the message was declined whole rather than \
+                                     truncated into a partially-populated event"
+                                );
+                                break;
+                            }
+                            Err(crate::bounded_read::CappedLineError::Io(e)) => {
+                                // Includes non-UTF-8, which `next_line()` also
+                                // reported as `InvalidData` and which the old
+                                // `while let Ok(Some(..))` ended the loop on
+                                // just as silently. Kept at debug: a client
+                                // vanishing mid-write is ordinary.
+                                debug!(
+                                    error = %e,
+                                    "hook socket: read failed; dropping connection"
+                                );
+                                break;
+                            }
+                        };
                         if let Ok(msg) = serde_json::from_str::<DaemonMessage>(&line) {
                             match msg {
                                 DaemonMessage::Delegate(signal) => {
@@ -2191,7 +2375,22 @@ async fn run_hook_loop(
                             // listing agents sees the fresher answer.
                             ingest_event(&state, &event_tx, &pty_registry, event).await;
                         } else {
-                            warn!("Malformed event: {line}");
+                            // The line is producer-controlled, and issue #903
+                            // is about not letting a producer make the daemon
+                            // spend unbounded resources on a message it is
+                            // going to reject. Logging it whole is the same
+                            // defect one step later: at the new 8 MiB ceiling
+                            // a malformed payload would write 8 MiB into the
+                            // deck log, so the read cap alone would have moved
+                            // the sink rather than closed it. A prefix plus the
+                            // true length keeps the line diagnosable — a real
+                            // hook payload is a JSON one-liner well under the
+                            // prefix, so nothing legitimate is even elided.
+                            warn!(
+                                line_bytes = line.len(),
+                                "Malformed event: {}",
+                                clamp_for_log(&line)
+                            );
                         }
                     }
                 });
@@ -2457,6 +2656,277 @@ mod hook_ingestion_tests {
         // racing `shutdown_all` against the still-live loop task.
         let _ = handle.await;
         registry.shutdown_all();
+    }
+
+    // -----------------------------------------------------------------------
+    // The hook socket's two ingest bounds (issues #903 / #319)
+    // -----------------------------------------------------------------------
+
+    /// A real `run_hook_loop` driven against a real hook socket, with the
+    /// daemon-side `AppState` the tests below read their verdict from.
+    ///
+    /// Deliberately binds WITHOUT `bind_socket`, for the reason spelled out in
+    /// `run_hook_loop_persists_agent_type_into_registry` above: that helper
+    /// flips the process-global umask around `bind`, and under `cargo test`
+    /// (where all lib tests share one process) that window races concurrent
+    /// tempdir creation in other tests. Socket permissions are irrelevant to
+    /// what these two assert.
+    struct HookLoopFixture {
+        _dir: tempfile::TempDir,
+        socket: PathBuf,
+        state: SharedState,
+        handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
+    }
+
+    impl HookLoopFixture {
+        fn start() -> Self {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod tempdir");
+            let socket = dir.path().join("hook.sock");
+            let listener = IpcListener::from_tokio_listener(
+                UnixListener::bind(&socket).expect("bind hook socket"),
+            );
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let handle = tokio::spawn({
+                let state = state.clone();
+                let registry = Arc::new(AgentPtyRegistry::new());
+                let shutdown = Arc::new(Notify::new());
+                let wtr = crate::issue_dispatch_run::new_worktree_registry();
+                async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+            });
+            Self {
+                _dir: dir,
+                socket,
+                state,
+                handle,
+            }
+        }
+
+        /// Poll until `session_id` has a card in the daemon's `AppState`.
+        /// Bounded so a regression (the event never applied) fails fast rather
+        /// than hanging the tier.
+        async fn wait_for_session(&self, session_id: &str) {
+            for _ in 0..80 {
+                if self.state.read().await.sessions.contains_key(session_id) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("session {session_id:?} never reached the daemon's AppState");
+        }
+
+        async fn has_session(&self, session_id: &str) -> bool {
+            self.state.read().await.sessions.contains_key(session_id)
+        }
+
+        /// Assert `session_id` stays absent for a bounded window. Only ever
+        /// used *after* a happens-after ordering fact has been established, so
+        /// it confirms "refused" rather than betting on "not yet".
+        async fn assert_session_stays_absent(&self, session_id: &str) {
+            for _ in 0..20 {
+                assert!(
+                    !self.has_session(session_id).await,
+                    "session {session_id:?} must not reach AppState"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+    }
+
+    /// One `session_start` line, padded with `padding` bytes of ASCII filler in
+    /// its metadata so the caller can put the serialized line at an exact
+    /// length. Returns the line WITHOUT its trailing newline, which is what
+    /// `read_capped_line` measures.
+    fn padded_session_start(session_id: &str, padding: usize) -> String {
+        serde_json::json!({
+            "session_id": session_id,
+            "agent_type": "claude_code",
+            "event_type": "session_start",
+            "timestamp": "2026-09-08T12:00:00Z",
+            "pane_id": format!("pane-{session_id}"),
+            "metadata": { "padding": "x".repeat(padding) },
+        })
+        .to_string()
+    }
+
+    /// How much padding puts `padded_session_start`'s line at exactly `target`
+    /// bytes. The filler is plain ASCII, so JSON encoding grows it 1:1 and the
+    /// difference between the unpadded line and the target IS the padding.
+    fn padding_for_line_len(session_id: &str, target: usize) -> usize {
+        let base = padded_session_start(session_id, 0).len();
+        target
+            .checked_sub(base)
+            .expect("the target line length must exceed the envelope")
+    }
+
+    /// Scenario: Drive the real `run_hook_loop` against a real hook socket and write two `session_start` lines that differ only in length — one of exactly `MAX_HOOK_LINE_BYTES`, one a single byte longer. The line at the cap must produce a card; the line over it must produce none, must not be truncated into a partial event, and must not stop the daemon serving the next connection.
+    #[spec("hooks/ingest/001")]
+    #[tokio::test]
+    async fn ingest_001_over_long_hook_line_is_refused_at_the_production_cap() {
+        use crate::bounded_read::MAX_HOOK_LINE_BYTES;
+
+        let fixture = HookLoopFixture::start();
+
+        // Exactly at the cap: accepted, because the cap is inclusive and
+        // because refusing here would truncate a legitimate producer — a
+        // `work-done` report is large by design (issues #508 / #509).
+        let at_cap = padded_session_start(
+            "at-cap",
+            padding_for_line_len("at-cap", MAX_HOOK_LINE_BYTES),
+        );
+        assert_eq!(
+            at_cap.len(),
+            MAX_HOOK_LINE_BYTES,
+            "the at-cap fixture must sit exactly on the boundary"
+        );
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        stream
+            .write_all(format!("{at_cap}\n").as_bytes())
+            .await
+            .expect("a line at the cap must be readable end to end");
+        stream.flush().await.unwrap();
+        fixture.wait_for_session("at-cap").await;
+        drop(stream);
+
+        // One byte over: refused. The write may well fail partway — the daemon
+        // stops reading and drops the connection the moment the line crosses
+        // the cap, which is the point — so its outcome is deliberately not
+        // asserted on.
+        let over_cap = padded_session_start(
+            "over-cap",
+            padding_for_line_len("over-cap", MAX_HOOK_LINE_BYTES + 1),
+        );
+        assert_eq!(over_cap.len(), MAX_HOOK_LINE_BYTES + 1);
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        let _ = stream.write_all(format!("{over_cap}\n").as_bytes()).await;
+        let _ = stream.flush().await;
+        drop(stream);
+
+        // The happens-after fact that makes "absent" mean "refused": a THIRD
+        // connection's ordinary event lands after the over-cap one was sent, so
+        // the loop has demonstrably moved on. Before the fix the over-cap line
+        // was simply buffered and applied like any other.
+        let ordinary = padded_session_start("after-refusal", 0);
+        let mut stream = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        stream
+            .write_all(format!("{ordinary}\n").as_bytes())
+            .await
+            .expect("write ordinary hook line");
+        stream.flush().await.unwrap();
+        fixture.wait_for_session("after-refusal").await;
+        drop(stream);
+
+        fixture.assert_session_stays_absent("over-cap").await;
+
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
+    }
+
+    #[test]
+    fn clamp_for_log_passes_a_short_line_through_unchanged() {
+        let line = r#"{"session_id":"s","event_type":"idle"}"#;
+        assert_eq!(clamp_for_log(line), line);
+    }
+
+    #[test]
+    fn clamp_for_log_marks_a_long_line_as_truncated() {
+        const MARKER: &str = "…<truncated>";
+        // A line at the ceiling the read cap allows — the case the clamp
+        // exists for. A line only a byte or two over the prefix comes back
+        // slightly LONGER than it went in, because the marker costs more than
+        // the bytes dropped; what is bounded is the producer's own contribution,
+        // not the rendered string, so that is what this asserts.
+        let line = "x".repeat(crate::bounded_read::MAX_HOOK_LINE_BYTES);
+        let got = clamp_for_log(&line);
+        assert!(
+            got.ends_with(MARKER),
+            "a clamped line must say so, or it reads as the whole payload"
+        );
+        assert_eq!(
+            got.len(),
+            MALFORMED_LOG_PREFIX_BYTES + MARKER.len(),
+            "the log line must carry at most the prefix plus the marker, \
+             whatever the producer sent"
+        );
+    }
+
+    /// The line is arbitrary UTF-8 from a producer, so the cut must land on a
+    /// char boundary. Slicing mid-character panics — inside the hook loop's
+    /// spawned task, which would take the connection down silently.
+    #[test]
+    fn clamp_for_log_cuts_on_a_char_boundary() {
+        // A 3-byte character repeated puts a character across every offset that
+        // is not a multiple of 3, including the prefix boundary.
+        for pad in 0..3 {
+            let line = format!(
+                "{}{}",
+                "a".repeat(pad),
+                "€".repeat(MALFORMED_LOG_PREFIX_BYTES)
+            );
+            let got = clamp_for_log(&line);
+            assert!(got.ends_with("…<truncated>"), "pad {pad} should clamp");
+        }
+    }
+
+    /// Scenario: Open `MAX_CONCURRENT_HOOK_CONNECTIONS` hook connections, each sending one `session_start` and then staying open, then open one more and send an event on it. The extra event must not be applied while every slot is held, and must be applied — not dropped — as soon as one of the held connections closes.
+    #[spec("hooks/ingest/002")]
+    #[tokio::test]
+    async fn ingest_002_concurrent_hook_connections_are_capped_without_losing_events() {
+        let fixture = HookLoopFixture::start();
+
+        // Fill every slot. Each connection proves it was ACCEPTED by landing an
+        // event, then stays open — so its task is parked in the read and its
+        // permit is genuinely held.
+        let mut held = Vec::new();
+        for i in 0..MAX_CONCURRENT_HOOK_CONNECTIONS {
+            let session = format!("held-{i:02}");
+            let mut stream = UnixStream::connect(&fixture.socket)
+                .await
+                .expect("connect hook socket");
+            stream
+                .write_all(format!("{}\n", padded_session_start(&session, 0)).as_bytes())
+                .await
+                .expect("write hook line");
+            stream.flush().await.unwrap();
+            fixture.wait_for_session(&session).await;
+            held.push(stream);
+        }
+
+        // One more. Its connect succeeds (the kernel's listen backlog takes it)
+        // but the loop cannot accept it, because it is waiting for a permit.
+        let mut blocked = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        blocked
+            .write_all(format!("{}\n", padded_session_start("over-limit", 0)).as_bytes())
+            .await
+            .expect("the write lands in the socket buffer even unaccepted");
+        blocked.flush().await.unwrap();
+
+        // Unlike `ingest_001`'s negative, this one has no happens-after to lean
+        // on — it is the bound itself, so the window is the assertion. It
+        // cannot flake red: with the cap absent the event is applied at once,
+        // and with the cap present nothing can apply it until a slot frees
+        // below.
+        fixture.assert_session_stays_absent("over-limit").await;
+
+        // Free one slot. The bound is backpressure, not admission control, so
+        // the event was delayed rather than dropped and must now arrive.
+        drop(held.pop().expect("a held connection"));
+        fixture.wait_for_session("over-limit").await;
+
+        drop(held);
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
     }
 
     /// Scenario: PRD #370's whole point, end to end, **restimulated for PRD
