@@ -1936,6 +1936,42 @@ async fn accept_hook_connection(
     Ok((permit, stream))
 }
 
+/// How long one hook connection may go without completing a message before the
+/// daemon reclaims its slot.
+///
+/// **This exists because [`MAX_CONCURRENT_HOOK_CONNECTIONS`] made a stalled
+/// connection expensive.** Before that cap, a peer that connected and never
+/// wrote cost one parked task and nothing else, and hook ingest carried on
+/// around it. With 32 slots, 32 such peers stop ingest altogether — so the cap
+/// on its own would have traded an unbounded-memory failure for an availability
+/// one that is *cheaper* to reach. Found by Greptile on the PR that added the
+/// cap, and correctly: the reclaim path is part of the bound, not a separate
+/// nicety.
+///
+/// **60 seconds is over an order of magnitude above anything legitimate.**
+/// Every producer this project ships is single-shot: `hook::send_to_socket`
+/// connects, writes one line, flushes and drops the stream, and the
+/// reply-bearing verbs (`get-seed`, `delegate`, `list-targets`) write,
+/// half-close, read one reply under their own 5s client-side bound, and close.
+/// None of them holds a connection idle for even a second.
+///
+/// **It is an idle bound, not a lifetime.** It wraps one `read_capped_line`
+/// call — "read one message" — which gives two properties from one timer: a
+/// peer that sends nothing is reclaimed, and so is one that *drips* bytes
+/// without ever completing a line (the shape `error/socket/005` pins on the
+/// client side, where an idle timeout alone was not enough because every byte
+/// re-armed it). The timer restarts per message, so a hypothetical third-party
+/// producer that keeps one connection open and streams events is unaffected as
+/// long as its gaps stay under a minute — the one behaviour this narrows for
+/// anything not shipped here, and stated rather than hidden.
+///
+/// What it does not close is a peer that behaves *just* well enough — one
+/// complete message a minute, or a reconnect each time a slot frees. Telling
+/// that apart from a real producer needs to know which producer it is, which is
+/// #318's provenance work. What this closes is the leaked or stalled
+/// connection, which is the case reachable by accident.
+const HOOK_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// How much of a rejected hook line reaches the log. See the call site in
 /// [`run_hook_loop`] for why this is clamped at all.
 const MALFORMED_LOG_PREFIX_BYTES: usize = 512;
@@ -1962,6 +1998,37 @@ async fn run_hook_loop(
     pty_registry: Arc<AgentPtyRegistry>,
     shutdown: Arc<Notify>,
     worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+) -> Result<(), DaemonError> {
+    run_hook_loop_with_idle_timeout(
+        listener,
+        state,
+        event_tx,
+        pty_registry,
+        shutdown,
+        worktree_registry,
+        HOOK_CONNECTION_IDLE_TIMEOUT,
+    )
+    .await
+}
+
+/// [`run_hook_loop`] with the idle bound supplied rather than read from
+/// [`HOOK_CONNECTION_IDLE_TIMEOUT`].
+///
+/// The seam exists so `hooks/ingest/003` can assert that a stalled connection's
+/// slot is actually reclaimed without spending the production minute on it.
+/// A parameter rather than an environment knob deliberately: a knob would be
+/// reachable in production too, and the value is not something an operator has
+/// any reason to tune (contrast `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS`, which is
+/// a documented production setting).
+#[allow(clippy::too_many_arguments)]
+async fn run_hook_loop_with_idle_timeout(
+    listener: IpcListener,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    pty_registry: Arc<AgentPtyRegistry>,
+    shutdown: Arc<Notify>,
+    worktree_registry: crate::issue_dispatch_run::WorktreeRegistry,
+    idle_timeout: Duration,
 ) -> Result<(), DaemonError> {
     // Issue #319: bound how many hook connections are being served at once.
     // Every accepted connection used to get its own `tokio::spawn` with nothing
@@ -2019,20 +2086,34 @@ async fn run_hook_loop(
                     // outcomes under a ceiling; see `MAX_HOOK_LINE_BYTES` for
                     // where the number comes from.
                     loop {
-                        let line = match crate::bounded_read::read_capped_line(
+                        // The `timeout` is what keeps a stalled connection from
+                        // holding its slot forever — see
+                        // `HOOK_CONNECTION_IDLE_TIMEOUT`. It wraps the READ and
+                        // nothing else, so a connection is never reclaimed while
+                        // the daemon is the one working: `dispatch`'s worktree
+                        // creation and `delegate`'s readiness wait both run in
+                        // the arms below, outside this call.
+                        let read = crate::bounded_read::read_capped_line(
                             &mut reader,
                             crate::bounded_read::MAX_HOOK_LINE_BYTES,
-                        )
-                        .await
+                        );
+                        let line = match tokio::time::timeout(idle_timeout, read).await
                         {
-                            Ok(Some(line)) => line,
+                            Err(_elapsed) => {
+                                warn!(
+                                    idle_timeout_ms = idle_timeout.as_millis(),
+                                    "hook socket: reclaiming a connection that                                      sent no complete message within the idle                                      window — every shipped producer writes one                                      line and closes, so this is a leaked or                                      stalled peer"
+                                );
+                                break;
+                            }
+                            Ok(Ok(Some(line))) => line,
                             // Peer closed — the ordinary end of every
                             // fire-and-forget send.
-                            Ok(None) => break,
-                            Err(crate::bounded_read::CappedLineError::TooLong {
+                            Ok(Ok(None)) => break,
+                            Ok(Err(crate::bounded_read::CappedLineError::TooLong {
                                 limit,
                                 line_bytes,
-                            }) => {
+                            })) => {
                                 // Refused, not truncated, and never silently: a
                                 // prefix of a JSON object can parse, so applying
                                 // one would mean acting on a half-populated
@@ -2060,7 +2141,7 @@ async fn run_hook_loop(
                                 );
                                 break;
                             }
-                            Err(crate::bounded_read::CappedLineError::Io(e)) => {
+                            Ok(Err(crate::bounded_read::CappedLineError::Io(e))) => {
                                 // Includes non-UTF-8, which `next_line()` also
                                 // reported as `InvalidData` and which the old
                                 // `while let Ok(Some(..))` ended the loop on
@@ -2679,7 +2760,13 @@ mod hook_ingestion_tests {
     }
 
     impl HookLoopFixture {
+        /// The loop at its production idle bound. Every assertion below
+        /// finishes in seconds, so the real minute never elapses.
         fn start() -> Self {
+            Self::start_with_idle_timeout(HOOK_CONNECTION_IDLE_TIMEOUT)
+        }
+
+        fn start_with_idle_timeout(idle_timeout: Duration) -> Self {
             let dir = tempfile::tempdir().expect("tempdir");
             std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
                 .expect("chmod tempdir");
@@ -2695,7 +2782,18 @@ mod hook_ingestion_tests {
                 let registry = Arc::new(AgentPtyRegistry::new());
                 let shutdown = Arc::new(Notify::new());
                 let wtr = crate::issue_dispatch_run::new_worktree_registry();
-                async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+                async move {
+                    run_hook_loop_with_idle_timeout(
+                        listener,
+                        state,
+                        event_tx,
+                        registry,
+                        shutdown,
+                        wtr,
+                        idle_timeout,
+                    )
+                    .await
+                }
             });
             Self {
                 _dir: dir,
@@ -2925,6 +3023,47 @@ mod hook_ingestion_tests {
         fixture.wait_for_session("over-limit").await;
 
         drop(held);
+        fixture.handle.abort();
+        let _ = fixture.handle.await;
+    }
+
+    /// Scenario: Fill every hook-connection slot with peers that connect and then send nothing at all, and drive the loop at a short idle bound. An event written on one more connection must still be applied, which can only happen once the daemon reclaims a stalled peer's slot.
+    #[spec("hooks/ingest/003")]
+    #[tokio::test]
+    async fn ingest_003_a_stalled_connection_does_not_hold_its_slot_forever() {
+        // Short enough that the test finishes in well under a second; the
+        // production bound is a minute and is asserted only by construction
+        // (`run_hook_loop` passes `HOOK_CONNECTION_IDLE_TIMEOUT`). What is
+        // under test is the reclaim, not the number.
+        let fixture = HookLoopFixture::start_with_idle_timeout(Duration::from_millis(250));
+
+        // Every slot taken by a peer that never writes a byte — the shape that
+        // made the connection cap a new availability failure mode before this
+        // bound existed.
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_CONCURRENT_HOOK_CONNECTIONS {
+            stalled.push(
+                UnixStream::connect(&fixture.socket)
+                    .await
+                    .expect("connect hook socket"),
+            );
+        }
+
+        let mut live = UnixStream::connect(&fixture.socket)
+            .await
+            .expect("connect hook socket");
+        live.write_all(format!("{}\n", padded_session_start("after-reclaim", 0)).as_bytes())
+            .await
+            .expect("the write lands in the socket buffer even unaccepted");
+        live.flush().await.unwrap();
+
+        // The only route to this event being applied is a stalled peer losing
+        // its slot: `ingest_002` pins that a connection which is merely OPEN
+        // and idle-but-live keeps its permit, so nothing else here can free
+        // one. Without the reclaim this hangs to the poll bound and fails.
+        fixture.wait_for_session("after-reclaim").await;
+
+        drop(stalled);
         fixture.handle.abort();
         let _ = fixture.handle.await;
     }

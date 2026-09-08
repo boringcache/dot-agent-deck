@@ -1740,6 +1740,20 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** how long a connection may hold its slot — there is no read timeout on this socket, deliberately (the two issues ask for the allocation bounds; bounding availability needs #318's provenance work to know which producer to blame); the saturation `warn!`; that the kernel's listen backlog is large enough for any particular burst.
 - **Platform coverage:** mac+linux (Unix-domain socket).
 
+##### hooks/ingest/003 — A hook connection that stalls without completing a message loses its slot, so the connection cap cannot wedge ingest (issue #903 / #319, Greptile P1 on PR #942).
+- **Layer:** L1 (the real `run_hook_loop` driven against a real Unix hook socket in-process, at an injected short idle bound; no PTY, no deck binary, no agent).
+- **Agent:** none (`MAX_CONCURRENT_HOOK_CONNECTIONS` peers that connect and write nothing, plus one that writes a `session_start`).
+- **Asserts:** with every slot held by a peer that never sends a byte, an event written on one further connection is still applied — which is reachable only by the daemon reclaiming a stalled peer's slot, since `hooks/ingest/002` pins that a merely-open live connection keeps its permit. This is the failure mode the connection cap *introduced*: before the cap a stalled peer cost one parked task and ingest carried on around it, so the cap without a reclaim path would have traded unbounded memory for cheaper unavailability.
+- **Does not assert:** the production value of the bound (60s — the loop is driven here at an injected 250ms, and `run_hook_loop` passing the constant is structural); the drip case specifically (one timer covers both because it wraps "read one message", but only the send-nothing shape is exercised); that a well-behaved-but-slow peer is distinguishable from a stalled one, which it deliberately is not — that needs #318's provenance work.
+- **Platform coverage:** mac+linux (Unix-domain socket).
+
+##### hooks/ingest/004 — The over-long-line refusal holds in the SPAWNED binary's daemon, with a real TUI attached (issue #903 / #319, Greptile P2 on PR #942).
+- **Layer:** L2 (real `dot-agent-deck` binary in a PTY, its own lazily-spawned daemon, per-test hook socket, assertions against the `vt100`-rendered grid).
+- **Agent:** none (two synthetic `session_start` lines written directly to the per-test hook socket, one of them a byte past `MAX_HOOK_LINE_BYTES`).
+- **Asserts:** after a line one byte over the cap, an ordinary `session_start` written on a fresh connection still renders its card — the deck survived and its daemon is still accepting — and the over-long event's card never appears within a window that opens only after that later card has completed the whole socket → daemon → broadcast → render round trip. `hooks/ingest/001` pins the same boundary against an in-process loop; this is the half that proves it in the daemon the shipped binary actually starts, with a client attached to it.
+- **Does not assert:** the inclusive boundary (the at-cap acceptance is `hooks/ingest/001`'s, at the same production constant, where the arithmetic is cheap to state); the connection cap or the stalled-connection reclaim (`hooks/ingest/002` / `/003` — neither has a rendered surface, and a negative assertion on the cap needs the permit accounting rather than the grid); the refusal's log wording; the writer's own outcome, which may legitimately fail partway once the daemon stops reading.
+- **Platform coverage:** mac+linux.
+
 #### hooks/install
 
 ##### hooks/install/001 — Launching the deck with `~/.claude/` present writes hook entries into `~/.claude/settings.json` idempotently.
