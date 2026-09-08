@@ -76,7 +76,9 @@
 //!    this crate emits. They follow one uniquely-named sentinel through every sink #827
 //!    enumerates — the document on disk across a load-modify-save round trip,
 //!    the IPC echo, the `desktop_get_settings` snapshot, the parse diagnostic,
-//!    and both halves of [`SettingsWriteError`] — and they are derived from the
+//!    and both halves of [`SettingsWriteError`] — reaching the two settings
+//!    commands through the public functions their bodies wrap, since a
+//!    `#[tauri::command]` needs a running app to call. They are derived from the
 //!    default document rather than from a list, so a field #802 adds is covered
 //!    the moment it appears and turns them red if it can hold text. The one
 //!    thing they do **not** claim: a key this schema does not own keeps whatever
@@ -2306,6 +2308,20 @@ forms it is.";
     /// therefore "no sink outside the sender", not "no sink at all". The sinks
     /// that matter — the disk, the echo a *later* read would carry, the app's
     /// own log — are covered here and in the two tests below.
+    ///
+    /// # What this exercises, precisely
+    ///
+    /// The `DesktopSettings` **deserializer**, which is what `desktop_set_settings`
+    /// takes as its argument, and the serialisation of what it returns. It does
+    /// **not** call the command function: a `#[tauri::command]` takes a
+    /// `Webview`, which cannot be constructed without a running app, so
+    /// `ensure_main_webview` and the framework's own argument decoding are
+    /// outside every test in this crate — see issue #823 for the missing tier.
+    /// [`tests::the_settings_commands_own_bodies_carry_no_value_from_the_document`]
+    /// drives the two command *bodies* through the public functions they are
+    /// each a one-line wrapper over, which is as close to the real handlers as
+    /// this tier reaches. Greptile raised this on PR #943, and the claim is
+    /// narrowed rather than overstated.
     #[test]
     fn a_credential_from_the_webview_reaches_neither_the_echo_nor_the_document() {
         let payloads = [
@@ -2459,6 +2475,79 @@ forms it is.";
         );
         assert!(raw.contains("stray_token"), "unexpected document: {raw}");
         assert!(raw.contains("api_key"), "unexpected document: {raw}");
+    }
+
+    /// The two settings commands' own bodies, driven end to end against a
+    /// sentinel-bearing document on disk.
+    ///
+    /// `desktop_get_settings` is `Ok(settings::load_snapshot())` after its
+    /// webview guard, and `desktop_set_settings` is `settings::save(&settings)`
+    /// then `Ok(settings)`. So calling [`load_snapshot`] and [`save`] under the
+    /// real path seam exercises everything in those handlers except
+    /// `ensure_main_webview` — which is what a unit tier can reach, since a
+    /// `Webview` needs a running Tauri app to exist.
+    ///
+    /// This is deliberately more than re-serialising a hand-built struct: the
+    /// snapshot here is the one the command would actually return, read off a
+    /// real file through the real resolver, with the real path in it.
+    #[test]
+    fn the_settings_commands_own_bodies_carry_no_value_from_the_document() {
+        let _guard = ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempdir();
+        let path = dir.path().join(SETTINGS_FILE_NAME);
+        std::fs::write(
+            &path,
+            format!(
+                "version = 1\n\n\
+                 [appearance]\n\
+                 mode = \"{SENTINEL}\"\n\n\
+                 [voice]\n\
+                 api_key = \"{SENTINEL}\"\n"
+            ),
+        )
+        .unwrap();
+
+        // SAFETY: the lock above serialises every test that touches this var.
+        unsafe { std::env::set_var(SETTINGS_PATH_ENV, &path) };
+        let snapshot = load_snapshot();
+        let saved = save(&snapshot.settings);
+        unsafe { std::env::remove_var(SETTINGS_PATH_ENV) };
+        saved.unwrap();
+
+        // The reply `desktop_get_settings` would send, as JSON, exactly as the
+        // bridge would receive it.
+        assert_free_of_sentinel(
+            "the `desktop_get_settings` reply",
+            &serde_json::to_string(&snapshot).unwrap(),
+        );
+        // Its `path` is present and is the file we pointed it at — the
+        // deliberate exception documented on `DesktopSettingsSnapshot`, and the
+        // reason this assertion is about the sentinel rather than about paths.
+        assert_eq!(snapshot.path, path.display().to_string());
+        assert_eq!(snapshot.settings.appearance.mode, AppearanceMode::System);
+
+        // The reply `desktop_set_settings` would echo.
+        assert_free_of_sentinel(
+            "the `desktop_set_settings` echo",
+            &serde_json::to_string(&snapshot.settings).unwrap(),
+        );
+
+        // And the document the save actually wrote: the owned field is
+        // scrubbed, the unowned one is preserved, exactly as
+        // `a_key_this_schema_does_not_own_keeps_its_value_and_reaches_nothing_else`
+        // establishes for the lower-level path.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            raw.matches(SENTINEL).count(),
+            1,
+            "unexpected document: {raw}"
+        );
+        assert!(
+            raw.contains("mode = \"system\""),
+            "unexpected document: {raw}"
+        );
     }
 
     /// The log sink, and the measurement that made [`invalid_document_log`]

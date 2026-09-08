@@ -151,6 +151,14 @@ enum FieldKind {
 /// and therefore out of the reach of `settings.rs`'s sentinel sweep.
 const HIDING_ATTRS: [&str; 2] = ["skip", "flatten"];
 
+/// The `Storage` methods that name a key through an argument.
+const KEY_METHODS: [&str; 3] = ["getItem", "setItem", "removeItem"];
+
+/// The `Storage` members that name no key, so reaching one is not a finding:
+/// `clear()` empties the store without naming anything, `key(n)` reads a name
+/// out by index, and `length` counts.
+const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
+
 /// The exact declared shape of the TypeScript settings DTOs.
 ///
 /// `(interface, field, type)`. Pinned rather than pattern-matched because a
@@ -253,16 +261,39 @@ struct RustField {
     line: usize,
 }
 
-/// Every field of every `*Settings` struct in `source`.
+/// What a scan of the settings structs found.
+///
+/// The `unparsed` half is the important one and the reason this is not just a
+/// `Vec<RustField>`: a line inside a settings struct that this scanner cannot
+/// read is a **finding**, never a skip. Greptile caught the fail-open version
+/// of this on PR #943 — `field_line` stripped only a bare `pub `, so
+/// `pub(crate) endpoint: String,` parsed to the nonsense name
+/// `pub(crate) endpoint`, was discarded, and the credential-boundary check
+/// passed with a free-text field in the schema. A guard that quietly ignores
+/// what it does not understand reports safety it never established, which is
+/// the same principle as the fail-closed filesystem walk.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SchemaScan {
+    fields: Vec<RustField>,
+    /// `(struct, 1-indexed line, the line's text)`.
+    unparsed: Vec<(String, usize, String)>,
+}
+
+/// Every field of every `*Settings` struct in `source`, plus every line inside
+/// one that could not be read as a field.
 ///
 /// A line scanner rather than a parse: this file is `rustfmt`-formatted, so a
-/// field is one line and a struct body ends at a `}` in column zero. The
-/// consequence to know is that a struct **not** named `*Settings` is not
-/// scanned — which is why an unrecognised field *type* is a failure rather
-/// than a skip, so a `voice: VoiceConfig` field cannot escape by naming its
-/// struct something else.
-fn rust_settings_fields(source: &str) -> Vec<RustField> {
-    let mut fields = Vec::new();
+/// field is one line and a struct body ends at a `}` in column zero. Two
+/// consequences are worth knowing, and each is answered by making something a
+/// failure rather than a skip:
+///
+/// - a struct **not** named `*Settings` is not scanned, which is why an
+///   unrecognised field *type* is a failure — so a `voice: VoiceConfig` field
+///   cannot escape by naming its struct something else;
+/// - a field spelled in a way this scanner does not handle is not silently
+///   dropped, which is why [`SchemaScan::unparsed`] exists.
+fn rust_settings_fields(source: &str) -> SchemaScan {
+    let mut scan = SchemaScan::default();
     let mut current: Option<String> = None;
     let mut attrs = String::new();
 
@@ -288,36 +319,70 @@ fn rust_settings_fields(source: &str) -> Vec<RustField> {
                 if line.starts_with("//") || line.is_empty() {
                     continue;
                 }
-                if let Some((name, ty)) = field_line(line) {
-                    fields.push(RustField {
+                match field_line(line) {
+                    Some((name, ty)) => scan.fields.push(RustField {
                         struct_name: struct_name.clone(),
                         name,
                         ty,
                         attrs: std::mem::take(&mut attrs),
                         line: index + 1,
-                    });
-                } else {
-                    attrs.clear();
+                    }),
+                    None => {
+                        attrs.clear();
+                        scan.unparsed
+                            .push((struct_name.clone(), index + 1, line.to_string()));
+                    }
                 }
             }
         }
     }
-    fields
+    scan
 }
 
 /// The name of the settings struct a line declares, if it declares one.
 fn struct_header(raw: &str) -> Option<String> {
-    let rest = raw
-        .strip_prefix("pub struct ")
-        .or_else(|| raw.strip_prefix("struct "))?;
+    let rest = strip_visibility(raw).strip_prefix("struct ")?;
     let name = rest.strip_suffix(" {")?;
     name.ends_with("Settings").then(|| name.to_string())
 }
 
-/// `pub name: Type,` split into its name and type, or `None` for anything else.
+/// `decl` with any leading Rust visibility removed.
+///
+/// Handles every form the language has: none, `pub`, and the restricted
+/// `pub(crate)` / `pub(super)` / `pub(in some::path)`. The restricted forms are
+/// what PR #943's fail-open turned on — `pub(crate) endpoint: String,` has no
+/// `pub ` prefix, so stripping that one literal left the visibility attached to
+/// the field name and the whole line was discarded as unreadable.
+fn strip_visibility(decl: &str) -> &str {
+    let Some(rest) = decl.strip_prefix("pub") else {
+        return decl;
+    };
+    // `pub(...)`: skip the balanced group. Nothing in Rust nests parentheses in
+    // a visibility, so the first `)` closes it.
+    let rest = match rest.strip_prefix('(') {
+        Some(restricted) => match restricted.find(')') {
+            Some(close) => &restricted[close + 1..],
+            // An unclosed `pub(` is not a visibility this can read; hand the
+            // line back unchanged so it lands in `unparsed` rather than being
+            // half-interpreted.
+            None => return decl,
+        },
+        None => rest,
+    };
+    // `pub` must be a whole word: `public_thing: u32` is a field, not a
+    // visibility followed by a type.
+    match rest.strip_prefix(' ') {
+        Some(body) => body.trim_start(),
+        None if rest.is_empty() => rest,
+        None => decl,
+    }
+}
+
+/// `pub name: Type,` split into its name and type, or `None` for anything this
+/// scanner cannot read — which the caller records as a finding rather than
+/// dropping.
 fn field_line(line: &str) -> Option<(String, String)> {
-    let body = line.strip_prefix("pub ").unwrap_or(line);
-    let body = body.strip_suffix(',')?;
+    let body = strip_visibility(line).strip_suffix(',')?;
     let (name, ty) = body.split_once(':')?;
     let name = name.trim();
     let ty = ty.trim();
@@ -352,13 +417,27 @@ fn block_after(source: &str, header: &str) -> Option<String> {
     None
 }
 
-/// The declared fields of a TypeScript interface body: `(name, type)`, with
+/// The declared members of a TypeScript interface body: `(name, type)`, with
 /// `?` kept on the name so an optional field is a different pin from a
 /// required one.
 ///
 /// Doc comments are skipped by their leading `*` / `//`, and a field whose type
 /// is an inline object is kept whole — the whole point of the pin is that
 /// `{ mode: AppearanceMode }` becoming `{ mode: string }` is a diff.
+///
+/// # Every member is read or reported; none is skipped
+///
+/// **A member terminator is optional in TypeScript**, and `;`, `,` and a bare
+/// newline are all valid. Greptile caught the fail-open version of this on PR
+/// #943: requiring a trailing `;` meant `apiKey: string` with no terminator was
+/// silently dropped, `found` was unchanged, and the exact-shape assertion passed
+/// with an unpinned free-text field on the DTO.
+///
+/// So all three terminators are accepted, and anything left that this function
+/// cannot read comes back as `(the line, String::new())` — a member with an
+/// empty type, which matches nothing in [`PINNED_TS_FIELDS`] and therefore
+/// fails the pin instead of vanishing from it. A guard's unreadable input has
+/// to be louder than its readable input, not quieter.
 fn ts_interface_fields(body: &str) -> Vec<(String, String)> {
     let mut fields = Vec::new();
     let mut depth = 0usize;
@@ -372,47 +451,114 @@ fn ts_interface_fields(body: &str) -> Vec<(String, String)> {
             continue;
         }
         // A multi-line inline object type would otherwise read as several
-        // fields. Nothing in these two interfaces is written that way today,
-        // and a change that introduced one should fail rather than be
-        // half-read.
+        // members. Nothing in these two interfaces is written that way today,
+        // and a change that introduced one lands in the unreadable bucket
+        // below rather than being half-read.
         if depth > 0 {
             depth += line.matches('{').count();
             depth -= line.matches('}').count().min(depth);
             continue;
         }
-        let Some(body) = line.strip_suffix(';') else {
-            depth += line.matches('{').count();
-            depth -= line.matches('}').count().min(depth);
+        let opens = line.matches('{').count();
+        let closes = line.matches('}').count();
+        if opens > closes {
+            depth += opens - closes;
+            fields.push((line.to_string(), String::new()));
             continue;
-        };
-        if let Some((name, ty)) = body.split_once(':') {
-            fields.push((name.trim().to_string(), ty.trim().to_string()));
+        }
+        // `;`, `,` or nothing at all — all three are valid TypeScript.
+        let member = line.strip_suffix(';').unwrap_or(line);
+        let member = member.strip_suffix(',').unwrap_or(member);
+        match member.split_once(':') {
+            Some((name, ty)) if !name.trim().is_empty() && !ty.trim().is_empty() => {
+                fields.push((name.trim().to_string(), ty.trim().to_string()));
+            }
+            // Unreadable: reported as itself with no type, so the pin fails.
+            _ => fields.push((line.to_string(), String::new())),
         }
     }
     fields
 }
 
-/// Every `localStorage.<op>(<first argument>` in `source`, with 1-indexed
-/// lines.
+/// Every `localStorage.<member>` in `source`, classified, with 1-indexed lines.
 ///
-/// The argument is taken verbatim up to the first top-level `,` or `)`, so a
-/// computed key is reported as the expression it is rather than being resolved
-/// — an unrecognised expression is exactly what this check exists to refuse.
-fn storage_accesses(source: &str) -> Vec<(usize, String, String)> {
+/// The member name is read first and decides everything, which is the part
+/// worth understanding: `getItem`/`setItem`/`removeItem` are the only members
+/// that name a key through an argument, so those get their argument extracted
+/// verbatim (up to the first top-level `,` or `)`) and everything else is a
+/// finding. The argument is deliberately **not** resolved — a computed key is
+/// reported as the expression it is, because an unrecognised expression is
+/// exactly what this check refuses.
+///
+/// Classifying by member rather than scanning forward for a `(` is what closes
+/// the property-access route: `localStorage.apiKey = secret` stores a key with
+/// no call at all, and the previous shape of this function read `apiKey` as a
+/// method name and then hunted for the next `(` anywhere later in the file —
+/// which reported a nonsense argument, or fell out of the loop entirely and
+/// stopped scanning the rest of the file.
+fn storage_uses(source: &str) -> Vec<StorageUse> {
     let mut found = Vec::new();
     let mut offset = 0usize;
-    while let Some(hit) = source[offset..].find("localStorage.") {
-        let at = offset + hit + "localStorage.".len();
-        let rest = &source[at..];
-        let Some(paren) = rest.find('(') else {
+    while offset <= source.len() {
+        let Some(hit) = source[offset..].find("localStorage.") else {
             break;
         };
-        let op = rest[..paren].trim().to_string();
+        let at = offset + hit + "localStorage.".len();
+        let rest = &source[at..];
+        let member: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '$'))
+            .collect();
         let line = source[..at].matches('\n').count() + 1;
-        found.push((line, op, first_argument(&rest[paren + 1..])));
-        offset = at + paren;
+        // Always advance by at least one character, and always by a whole one,
+        // so a malformed `localStorage..` can neither loop forever nor slice
+        // through the middle of a multi-byte character.
+        let advance = if member.is_empty() {
+            rest.chars().next().map_or(1, char::len_utf8)
+        } else {
+            member.len()
+        };
+        offset = (at + advance).min(source.len());
+
+        if KEYLESS_MEMBERS.contains(&member.as_str()) {
+            continue;
+        }
+        if !KEY_METHODS.contains(&member.as_str()) {
+            found.push(StorageUse::Member { line, member });
+            continue;
+        }
+        // A key-naming method has to be called right here. A bare reference
+        // (`onClick={localStorage.removeItem}`) is the aliasing shape by
+        // another route, so it lands in the same bucket.
+        match rest[member.len()..].trim_start().strip_prefix('(') {
+            Some(args) => found.push(StorageUse::Keyed {
+                line,
+                op: member,
+                argument: first_argument(args),
+            }),
+            None => found.push(StorageUse::Member { line, member }),
+        }
     }
     found
+}
+
+/// One use of `localStorage.<member>` in the shipped code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageUse {
+    /// A call that names a key, with the key expression exactly as written.
+    Keyed {
+        line: usize,
+        op: String,
+        argument: String,
+    },
+    /// Anything else reached through the `.`, which is a finding rather than
+    /// something to analyse.
+    ///
+    /// **This is the property-access route, and it is not hypothetical:**
+    /// `localStorage.apiKey = secret` stores a key just as `setItem` does, and
+    /// no scan of call arguments can see it — the member name *is* the key. A
+    /// bare method reference lands here too, for the same reason an alias does.
+    Member { line: usize, member: String },
 }
 
 /// Every occurrence of `localStorage` in `source` that is **not** immediately
@@ -420,7 +566,7 @@ fn storage_accesses(source: &str) -> Vec<(usize, String, String)> {
 ///
 /// This is what closes the aliasing route, and without it the key pin would be
 /// a formality: `const store = window.localStorage;` followed by
-/// `store.setItem(anything, secret)` names no key [`storage_accesses`] can see,
+/// `store.setItem(anything, secret)` names no key [`storage_uses`] can see,
 /// and neither does `const { setItem } = window.localStorage`. So the shipped
 /// code may only ever spell it `localStorage.<op>(…)`, and any other use of the
 /// identifier is refused rather than analysed.
@@ -640,7 +786,7 @@ mod tests {
     #[test]
     fn every_settings_field_has_a_type_that_cannot_carry_a_credential() {
         let source = read(SETTINGS_RS);
-        let fields = rust_settings_fields(&source);
+        let SchemaScan { fields, unparsed } = rust_settings_fields(&source);
         assert!(
             fields.len() >= 5,
             "the scan found only {} field(s), so it has stopped reading the schema \
@@ -650,6 +796,14 @@ mod tests {
 
         let scanned: BTreeSet<&str> = fields.iter().map(|f| f.struct_name.as_str()).collect();
         let mut offenders = Vec::new();
+        // Unreadable first: a line this scanner cannot parse is the one case
+        // where it knows nothing about a field, so it cannot be a pass.
+        for (struct_name, line, text) in &unparsed {
+            offenders.push(format!(
+                "{SETTINGS_RS}:{line}: this line inside {struct_name} could not be read as \
+                 a field, so its type was never checked: `{text}`"
+            ));
+        }
         for field in &fields {
             let allowed = ALLOWED_FIELD_TYPES
                 .iter()
@@ -708,7 +862,8 @@ pub struct VoiceSettings {
     pub extra: AppearanceSettings,
 }
 ";
-        let fields = rust_settings_fields(source);
+        let SchemaScan { fields, unparsed } = rust_settings_fields(source);
+        assert!(unparsed.is_empty(), "{unparsed:#?}");
         assert_eq!(fields.len(), 4, "{fields:#?}");
         assert_eq!(fields[1].name, "endpoint");
         assert_eq!(fields[1].ty, "String");
@@ -730,6 +885,81 @@ pub struct VoiceSettings {
                 "the fixture should exercise `{fragment}`"
             );
         }
+    }
+
+    /// The two fail-opens Greptile found on PR #943, kept as regression tests
+    /// because both were the same defect: a scanner that **silently skipped**
+    /// what it could not parse, in a check whose whole job is to refuse what it
+    /// does not recognise. Each let a free-text field into the schema with
+    /// every gate green.
+    #[test]
+    fn a_field_this_scanner_cannot_read_is_a_finding_rather_than_a_skip() {
+        // Rust side: `pub(crate)` has no `pub ` prefix, so the old
+        // `strip_prefix("pub ")` left the visibility glued to the name, the
+        // line parsed to nothing, and the field was dropped.
+        for visibility in [
+            "",
+            "pub ",
+            "pub(crate) ",
+            "pub(super) ",
+            "pub(in crate::a) ",
+        ] {
+            let source =
+                format!("pub struct VoiceSettings {{\n    {visibility}endpoint: String,\n}}\n");
+            let SchemaScan { fields, unparsed } = rust_settings_fields(&source);
+            assert!(unparsed.is_empty(), "{visibility:?}: {unparsed:#?}");
+            assert_eq!(
+                fields
+                    .iter()
+                    .map(|f| (f.name.as_str(), f.ty.as_str()))
+                    .collect::<Vec<_>>(),
+                [("endpoint", "String")],
+                "a `{visibility}` field must still be read, and read correctly"
+            );
+        }
+
+        // `pub` must be a whole word, or a field legitimately named
+        // `public_thing` would be mangled.
+        let SchemaScan { fields, .. } =
+            rust_settings_fields("pub struct VoiceSettings {\n    pub public_id: u32,\n}\n");
+        assert_eq!(fields[0].name, "public_id");
+
+        // And anything genuinely unreadable is reported, not dropped: an
+        // unclosed visibility, a multi-line type, and a line with no colon.
+        let SchemaScan { fields, unparsed } = rust_settings_fields(
+            "pub struct VoiceSettings {\n    pub(crate endpoint: String,\n    pub keys: Vec<\n    nonsense\n}\n",
+        );
+        assert!(fields.is_empty(), "{fields:#?}");
+        assert_eq!(unparsed.len(), 3, "{unparsed:#?}");
+        assert!(unparsed.iter().all(|(name, _, _)| name == "VoiceSettings"));
+
+        // TypeScript side: a member terminator is optional, so requiring `;`
+        // dropped a perfectly valid `apiKey: string`. All three spellings are
+        // read now, and an unreadable line comes back with an empty type so it
+        // cannot match a pin.
+        assert_eq!(
+            ts_interface_fields("  apiKey: string\n  token: string,\n  version: number;\n"),
+            [
+                ("apiKey".to_string(), "string".to_string()),
+                ("token".to_string(), "string".to_string()),
+                ("version".to_string(), "number".to_string()),
+            ]
+        );
+        assert_eq!(
+            ts_interface_fields(
+                "  [key: string]: unknown;\n  nested: {\n    secret: string;\n  };\n"
+            ),
+            [
+                // An index signature is read as a member — and one whose name
+                // is not in the pin, so it fails it.
+                ("[key".to_string(), "string]: unknown".to_string()),
+                ("nested: {".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(
+            ts_interface_fields("  justAName\n"),
+            [("justAName".to_string(), String::new())]
+        );
     }
 
     /// Check 2: the TypeScript DTO's shape, pinned field by field.
@@ -852,16 +1082,23 @@ pub struct VoiceSettings {
                 ));
             }
 
-            for (line, op, argument) in storage_accesses(&text) {
-                // `clear()` and the iteration accessors name no key.
-                if argument.is_empty() {
-                    continue;
-                }
-                if !allowed_exprs.contains(&argument) {
-                    offenders.push(format!(
-                        "{rel}:{line}: localStorage.{op}({argument}) — `{argument}` is not \
-                         one of the pinned storage-key constants"
-                    ));
+            for use_ in storage_uses(&text) {
+                match use_ {
+                    StorageUse::Keyed { line, op, argument }
+                        if !allowed_exprs.contains(&argument) =>
+                    {
+                        offenders.push(format!(
+                            "{rel}:{line}: localStorage.{op}({argument}) — `{argument}` is \
+                             not one of the pinned storage-key constants"
+                        ));
+                    }
+                    StorageUse::Keyed { .. } => {}
+                    StorageUse::Member { line, member } => offenders.push(format!(
+                        "{rel}:{line}: localStorage.{member} — only \
+                         getItem/setItem/removeItem (and the keyless clear/key/length) may \
+                         be reached through `localStorage.`; a property access stores a key \
+                         whose name no argument scan can read"
+                    )),
                 }
             }
 
@@ -914,9 +1151,15 @@ window.localStorage.removeItem(`${base}.${mode}`);
 window.localStorage.clear();
 localStorage.setItem(modeScopedKey("dot-agent-deck.desktop.new.v1"), token);
 "#;
-        let accesses = storage_accesses(source);
+        let keyed: Vec<(usize, String, String)> = storage_uses(source)
+            .into_iter()
+            .filter_map(|use_| match use_ {
+                StorageUse::Keyed { line, op, argument } => Some((line, op, argument)),
+                StorageUse::Member { .. } => None,
+            })
+            .collect();
         assert_eq!(
-            accesses
+            keyed
                 .iter()
                 .map(|(line, op, arg)| (*line, op.as_str(), arg.as_str()))
                 .collect::<Vec<_>>(),
@@ -924,32 +1167,68 @@ localStorage.setItem(modeScopedKey("dot-agent-deck.desktop.new.v1"), token);
                 (2, "setItem", "PROMPTS_STORAGE_KEY"),
                 (3, "getItem", "\"dot-agent-deck.desktop.api-key.v1\""),
                 (4, "removeItem", "`${base}.${mode}`"),
-                (5, "clear", ""),
                 (
                     6,
                     "setItem",
                     "modeScopedKey(\"dot-agent-deck.desktop.new.v1\")"
                 ),
-            ]
+            ],
+            "`clear()` names no key, so it must not appear as a keyed access"
         );
 
         // An inline literal, a computed key and a `modeScopedKey(...)` call are
         // all refused, because none of them is a pinned constant — which is
-        // what makes a new key impossible to add by accident.
+        // what makes a new key hard to add by accident.
         let pinned: BTreeSet<&str> = PINNED_STORAGE_KEYS
             .iter()
             .map(|(constant, _, _)| *constant)
             .collect();
-        for (_, _, argument) in &accesses {
-            if argument.is_empty() {
-                continue;
-            }
+        for (_, _, argument) in &keyed {
             assert_eq!(
                 pinned.contains(argument.as_str()),
                 argument == "PROMPTS_STORAGE_KEY",
                 "unexpected verdict for {argument}"
             );
         }
+
+        // The property-access route, which is the hole that classifying by
+        // member name closes: the member IS the key, so no argument scan could
+        // ever see it. A bare method reference lands in the same bucket, and
+        // the keyless members in neither.
+        assert_eq!(
+            storage_uses(
+                "localStorage.apiKey = secret;\n\
+                 const f = localStorage.removeItem;\n\
+                 void localStorage.length;\n\
+                 localStorage.key(0);\n"
+            ),
+            vec![
+                StorageUse::Member {
+                    line: 1,
+                    member: "apiKey".to_string()
+                },
+                StorageUse::Member {
+                    line: 2,
+                    member: "removeItem".to_string()
+                },
+            ]
+        );
+
+        // A malformed member neither loops forever nor slices through a
+        // multi-byte character.
+        assert_eq!(
+            storage_uses("localStorage..é\nlocalStorage."),
+            vec![
+                StorageUse::Member {
+                    line: 1,
+                    member: String::new()
+                },
+                StorageUse::Member {
+                    line: 2,
+                    member: String::new()
+                },
+            ]
+        );
 
         // And the literal sweep sees both spellings, with the wrapper kept so
         // scoped and unscoped keys are different pins.
@@ -980,13 +1259,12 @@ const { setItem } = window.localStorage;
         assert_eq!(aliases.len(), 2, "{aliases:#?}");
         assert_eq!(aliases[0].0, 2);
         assert_eq!(aliases[1].0, 4);
-        // And the aliased write names no key the access scan can see, which is
+        // And the aliased write names no key the use scan can see, which is
         // exactly why the alias itself has to be the finding.
         assert!(
-            storage_accesses(&masked)
-                .iter()
-                .all(|(_, op, _)| op != "setItem"),
-            "the aliased call should be invisible to the access scan"
+            storage_uses(&masked).is_empty(),
+            "the aliased call should be invisible to the use scan: {:#?}",
+            storage_uses(&masked)
         );
 
         // Prose is not a finding, and a commented-out access is not an access.
@@ -1005,11 +1283,12 @@ window.localStorage.getItem(PROMPTS_STORAGE_KEY);
             storage_aliases(&masked)
         );
         assert_eq!(
-            storage_accesses(&masked)
-                .iter()
-                .map(|(_, op, arg)| (op.as_str(), arg.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("getItem", "PROMPTS_STORAGE_KEY")]
+            storage_uses(&masked),
+            vec![StorageUse::Keyed {
+                line: 7,
+                op: "getItem".to_string(),
+                argument: "PROMPTS_STORAGE_KEY".to_string()
+            }]
         );
 
         // A `//` inside a string must not swallow the code after it, or the
@@ -1037,8 +1316,9 @@ window.localStorage.getItem(PROMPTS_STORAGE_KEY);
         // `voice: VoiceConfig` still goes red from the field that references
         // it. (`NotSettings` would be a poor fixture for this: it ends in
         // `Settings`.)
-        assert!(
-            rust_settings_fields("pub struct VoiceConfig {\n    pub a: String,\n}\n").is_empty()
+        assert_eq!(
+            rust_settings_fields("pub struct VoiceConfig {\n    pub a: String,\n}\n"),
+            SchemaScan::default()
         );
     }
 
