@@ -1,0 +1,6 @@
+workspace = "boringcache/dot-agent-deck-onboarding"
+
+[adapters.sccache]
+tag = "fresh-worktrees"
+no-git = true
+fail-on-cache-error = true
