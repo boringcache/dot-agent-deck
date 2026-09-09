@@ -2,7 +2,7 @@
 set -euo pipefail
 : "${VALIDATION_EVIDENCE:?}"
 : "${PROVIDER:?}"
-export CARGO_TARGET_DIR="$PWD/target"
+export CARGO_TARGET_DIR=target
 test ! -e "$CARGO_TARGET_DIR"
 mkdir -p "$VALIDATION_EVIDENCE"
 measure() {
