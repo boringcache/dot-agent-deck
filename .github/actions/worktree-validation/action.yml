@@ -23,7 +23,7 @@ runs:
         SOURCE_OVERRIDE: ${{ inputs.source }}
       run: |
         source_commit=${SOURCE_OVERRIDE:-$(cat .github/boringcache-source)}
-        worktree="$(dirname "$GITHUB_WORKSPACE")/dot-$PHASE"
+        worktree="$(dirname "$GITHUB_WORKSPACE")/dot-$PHASE-${source_commit:0:12}"
         evidence="$RUNNER_TEMP/validation-$PHASE"
         mkdir -p "$evidence"
         git worktree add -b "cache-$PHASE" "$worktree" "$source_commit"

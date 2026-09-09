@@ -1,6 +1,6 @@
 workspace = "boringcache/dot-agent-deck-onboarding"
 
 [adapters.sccache]
-tag = "fresh-worktrees-relative-target"
+tag = "fresh-worktrees-stable-linker"
 no-git = true
 fail-on-cache-error = true

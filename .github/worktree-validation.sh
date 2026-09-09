@@ -3,6 +3,9 @@ set -euo pipefail
 : "${VALIDATION_EVIDENCE:?}"
 : "${PROVIDER:?}"
 export CARGO_TARGET_DIR=target
+cmp scripts/link-gate.sh "$GITHUB_WORKSPACE/scripts/link-gate.sh"
+cmp scripts/build-gate.sh "$GITHUB_WORKSPACE/scripts/build-gate.sh"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$GITHUB_WORKSPACE/scripts/link-gate.sh"
 test ! -e "$CARGO_TARGET_DIR"
 mkdir -p "$VALIDATION_EVIDENCE"
 measure() {
