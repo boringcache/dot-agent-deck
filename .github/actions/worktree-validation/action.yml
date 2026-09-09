@@ -61,7 +61,7 @@ runs:
     - name: Start shared compiler cache
       id: cache
       if: inputs.provider == 'BoringCache'
-      uses: boringcache/one@a610ec5a564efd9b360925056dbade04deb5def6 # v1.30.0
+      uses: boringcache/one@404b744a2053da4cf963f13f615f7fafe94f3cf7 # v1.30.1
       with:
         cli-version: ${{ inputs.cli_version }}
         working-directory: ${{ env.VALIDATION_WORKTREE }}
