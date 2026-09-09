@@ -1,0 +1,26 @@
+name: Worktree cache commit validation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: dot-agent-deck-cache-validation
+  cancel-in-progress: false
+jobs:
+  commit:
+    name: BoringCache worktree commit
+    if: github.repository == 'boringcache/dot-agent-deck' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/worktree-validation
+        with:
+          provider: BoringCache
+          phase: commit

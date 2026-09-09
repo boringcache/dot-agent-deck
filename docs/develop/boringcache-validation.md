@@ -1,0 +1,15 @@
+# BoringCache worktree validation
+
+This fork measures shared compiler caching for fresh worktrees described in issues [927](https://github.com/vfarcic/dot-agent-deck/issues/927) and [864](https://github.com/vfarcic/dot-agent-deck/issues/864). Each job creates a Git worktree at the recorded original upstream commit and confirms its target directory does not exist before building. BoringCache stores compiler outputs through sccache; target directories and Cargo downloads are not restored or shared.
+
+The selected workload runs `cargo fmt --check`, `cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings`, `cargo test-fast`, and `cargo xtask linkage-check`. This includes the desktop Rust crate and workspace helper crates. The clippy command type-checks both e2e feature sets; it does not execute either e2e suite. The workload preserves upstream debug profiles, feature selection, linker script, and computed link-slot limit. `CARGO_INCREMENTAL=0` is set on both providers because sccache requires non-incremental compilation; each target starts empty.
+
+The Ubuntu 24.04 runner uses Rust 1.97.1, cargo-nextest 0.9.143, sccache 0.17.0, and the upstream Linux desktop libraries. BoringCache One is pinned to its reviewed release commit; an optional dispatch input can override its CLI version for a separate experiment. GitHub OIDC supplies short-lived credentials after the repository connection is approved.
+
+Run **Fresh worktree cache validation** for an uncached reference, a trusted cold compiler-cache writer, and a restore-only warm job on a fresh runner. Two dependent restore-only jobs then create different branches at the captured base and first upstream change. They run on separate hosted runners and test simultaneous remote-cache reuse. They do not measure contention between two builds sharing one machine.
+
+Run **Worktree cache commit validation** after each signed upstream-source advance. `.github/boringcache-source` records the original upstream SHA. The validation branch advances by one captured first-parent change at a time. The five captured changes modify automation and agent skills, not Rust source, Cargo manifests, Cargo.lock, or the linker scripts. Git-derived build metadata can still change. This sequence tests continued reuse across those changes, not dependency or Rust implementation churn.
+
+The added workflows do not replace the repository's complete CI. They omit release compilation and packaging, deterministic e2e execution, live-agent tests, macOS and Windows jobs, aarch64 cross-builds, Nix/devbox checks, desktop TypeScript tests and bundles, documentation builds, and issue/release automation.
+
+Artifacts retain source identity, exact tool versions, empty-target checks, gate timings, target size, nextest JUnit, and native sccache statistics. The Action logs include cache setup and publication evidence. Native source-root reuse availability is reported separately; installing sccache does not by itself establish cross-worktree application hits. The comparison does not reproduce a shared-target alternative or the upstream development machine.

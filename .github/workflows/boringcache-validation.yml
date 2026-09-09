@@ -1,0 +1,96 @@
+name: Fresh worktree cache validation
+on:
+  workflow_dispatch:
+    inputs:
+      cli_version:
+        description: Optional exact BoringCache CLI release or prerelease
+        type: string
+        default: ''
+permissions:
+  contents: read
+concurrency:
+  group: dot-agent-deck-cache-validation
+  cancel-in-progress: false
+jobs:
+  uncached:
+    name: No cache worktree uncached
+    if: github.repository == 'boringcache/dot-agent-deck' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/worktree-validation
+        with:
+          provider: No cache
+          phase: uncached
+          cli_version: ${{ inputs.cli_version }}
+  cold:
+    name: BoringCache worktree cold
+    if: github.repository == 'boringcache/dot-agent-deck' && github.ref == 'refs/heads/boringcache-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/worktree-validation
+        with:
+          provider: BoringCache
+          phase: cold
+          cli_version: ${{ inputs.cli_version }}
+  warm:
+    name: BoringCache worktree warm
+    if: github.repository == 'boringcache/dot-agent-deck' && github.ref == 'refs/heads/boringcache-validation'
+    needs: cold
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/worktree-validation
+        with:
+          provider: BoringCache
+          phase: warm
+          cli_version: ${{ inputs.cli_version }}
+  concurrent:
+    name: BoringCache concurrent worktree ${{ matrix.worktree }}
+    needs: warm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - worktree: first
+            source: 443433a12520817ca81f4204535dc0e735dd93ab
+          - worktree: second
+            source: 33288f55892574212f1a5a35eb3b705cf6be738e
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/worktree-validation
+        with:
+          provider: BoringCache
+          phase: concurrent-${{ matrix.worktree }}
+          source: ${{ matrix.source }}
+          cli_version: ${{ inputs.cli_version }}
